@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 
 namespace strata::core::glmp2p {
@@ -68,6 +69,39 @@ inline size_t first_mismatch(const void* a, const void* b, size_t n) {
     for (size_t i = 0; i < n; ++i)
         if (x[i] != y[i]) return i;
     return n;
+}
+
+// Counts for one process. queued is every peer hop_out. A later hop_out of the same slot before hop_in
+// overwrites that snapshot (a rejected draft's head-to-tail residual). consumed is hop_in installing it.
+// launched is a consumer compare actually queued. match/mismatch are compares that finished.
+struct HopLedger {
+    uint64_t queued = 0;
+    uint64_t overwritten = 0;
+    uint64_t consumed = 0;
+    uint64_t launched = 0;
+    uint64_t match = 0;
+    uint64_t mismatch = 0;
+    uint64_t skipped = 0;
+};
+
+struct HopLedgerView {
+    uint64_t outstanding = 0;   // queued, not overwritten, not installed
+    uint64_t unconsumed = 0;    // overwritten + outstanding
+    uint64_t pending = 0;       // launched, callback not finished
+    bool consumed_checked = false;
+    bool arithmetic_ok = false;
+};
+
+inline HopLedgerView view_ledger(const HopLedger& a) {
+    HopLedgerView v;
+    v.arithmetic_ok = a.overwritten <= a.queued && a.consumed <= a.queued - a.overwritten &&
+                      a.match + a.mismatch <= a.launched && a.launched + a.skipped <= a.consumed;
+    if (!v.arithmetic_ok) return v;
+    v.outstanding = a.queued - a.overwritten - a.consumed;
+    v.unconsumed = a.overwritten + v.outstanding;
+    v.pending = a.launched - a.match - a.mismatch;
+    v.consumed_checked = v.pending == 0 && a.match + a.mismatch + a.skipped == a.consumed;
+    return v;
 }
 
 }  // namespace strata::core::glmp2p

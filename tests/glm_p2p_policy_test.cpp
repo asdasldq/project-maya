@@ -50,6 +50,28 @@ static void test_probe_failures_stay_host() {
     CHECK(std::strcmp(peer.reason, gp::HopReasons::kPeer) == 0);
 }
 
+static void test_ledger() {
+    // A rejected draft overwrites the head-to-tail snapshot; the request can also stop with one
+    // speculative handoff queued and never installed. Those are not missing consumer checks.
+    gp::HopLedger rev2;
+    rev2.queued = 223;
+    rev2.overwritten = 22;
+    rev2.consumed = 200;
+    rev2.launched = 200;
+    rev2.match = 200;
+    const gp::HopLedgerView v = gp::view_ledger(rev2);
+    CHECK(v.arithmetic_ok);
+    CHECK(v.outstanding == 1);
+    CHECK(v.unconsumed == 23);
+    CHECK(v.pending == 0);
+    CHECK(v.consumed_checked);
+    gp::HopLedger bad = rev2;
+    bad.match = 199;
+    const gp::HopLedgerView w = gp::view_ledger(bad);
+    CHECK(w.pending == 1);
+    CHECK(!w.consumed_checked);
+}
+
 static void test_mismatch() {
     const unsigned char a[] = {1, 2, 3, 4};
     const unsigned char b[] = {1, 2, 9, 4};
@@ -79,6 +101,7 @@ int main() {
     test_default_is_host();
     test_probe_failures_stay_host();
     test_mismatch();
+    test_ledger();
     test_slot_and_size();
     if (g_fail != 0) {
         std::fprintf(stderr, "%d checks failed\n", g_fail);

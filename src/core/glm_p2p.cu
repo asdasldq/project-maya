@@ -55,6 +55,11 @@ std::atomic<uint64_t> g_peer_bytes{0};
 std::atomic<uint64_t> g_host_bytes{0};
 std::atomic<uint64_t> g_check_match{0};
 std::atomic<uint64_t> g_check_mismatch{0};
+std::atomic<uint64_t> g_queued{0};
+std::atomic<uint64_t> g_overwritten{0};
+std::atomic<uint64_t> g_consumed{0};
+std::atomic<uint64_t> g_launched{0};
+std::atomic<uint64_t> g_skipped{0};
 std::atomic<int> g_check_logged{0};
 
 bool dev_ok(int d) { return d >= 0 && d < kMaxDev; }
@@ -379,9 +384,14 @@ bool hop_out(int src_dev, int dst_dev, const float* src, size_t bytes, float* ho
     if (slot >= 0 && slot < kPeerSlots && dev_ok(src_dev) && dev_ok(dst_dev)) {
         std::lock_guard<std::mutex> lk(g_mu);
         Pair& p = g_pair[src_dev][dst_dev];
+        // A rejected draft writes this slot, then the redo writes it again before the tail reads.
+        // The first snapshot is never installed. Count it here, not as a missed consumer check.
+        if (peer && p.issue_valid[slot] && p.issue_peer[slot])
+            g_overwritten.fetch_add(1, std::memory_order_relaxed);
         p.issue_valid[slot] = true;
         p.issue_peer[slot] = peer;
     }
+    if (peer) g_queued.fetch_add(1, std::memory_order_relaxed);
     note(src_dev, dst_dev, peer, bytes, slot, "decode", true);
     return true;
 }
@@ -434,6 +444,7 @@ bool hop_in(int src_dev, int dst_dev, float* dst, size_t bytes, float* host, cud
             err = "glm p2p: the destination bounce did not install";
             return false;
         }
+        bool launched = false;
         if (check_on() && got != nullptr && host != nullptr && dev_ok(src_dev) && dev_ok(dst_dev) && slot >= 0 &&
             slot < kPeerSlots) {
             if (cudaMemcpyAsync(got, dst, bytes, cudaMemcpyDeviceToHost, dst_stream) != cudaSuccess) {
@@ -447,9 +458,13 @@ bool hop_in(int src_dev, int dst_dev, float* dst, size_t bytes, float* host, cud
                 c.dst = dst_dev;
                 c.slot = slot;
                 std::atomic_thread_fence(std::memory_order_release);
-                if (cudaLaunchHostFunc(dst_stream, check_cb, &c) != cudaSuccess) (void) cudaGetLastError();
+                if (cudaLaunchHostFunc(dst_stream, check_cb, &c) == cudaSuccess) launched = true;
+                else (void) cudaGetLastError();
             }
         }
+        g_consumed.fetch_add(1, std::memory_order_relaxed);
+        if (launched) g_launched.fetch_add(1, std::memory_order_relaxed);
+        else g_skipped.fetch_add(1, std::memory_order_relaxed);
         (void) src_stream;
         return true;
     }
@@ -506,6 +521,18 @@ bool hop_sync(int src_dev, int dst_dev, float* dst, const float* src, size_t byt
 
 std::string stat_line() {
     if (!env_on()) return {};
+    // Once per request print. Host callbacks already queued on the consumer streams finish here,
+    // so pending is not "the compare has not run yet".
+    if (check_on()) {
+        int n = 0;
+        if (cudaGetDeviceCount(&n) == cudaSuccess) {
+            DevRestore restore;
+            for (int d = 0; d < n; ++d) {
+                cudaSetDevice(d);
+                cudaDeviceSynchronize();
+            }
+        }
+    }
     const uint64_t ph = g_peer_hops.load(std::memory_order_relaxed);
     const uint64_t hh = g_host_hops.load(std::memory_order_relaxed);
     const uint64_t pb = g_peer_bytes.load(std::memory_order_relaxed);
@@ -513,8 +540,22 @@ std::string stat_line() {
     std::string out = "glm p2p: runtime hops peer=" + std::to_string(ph) + " host=" + std::to_string(hh) +
                       " (peer " + std::to_string(pb) + " B, host " + std::to_string(hb) + " B)";
     if (check_on()) {
-        out += " check match=" + std::to_string(g_check_match.load(std::memory_order_relaxed)) +
-               " mismatch=" + std::to_string(g_check_mismatch.load(std::memory_order_relaxed));
+        HopLedger led;
+        led.queued = g_queued.load(std::memory_order_relaxed);
+        led.overwritten = g_overwritten.load(std::memory_order_relaxed);
+        led.consumed = g_consumed.load(std::memory_order_relaxed);
+        led.launched = g_launched.load(std::memory_order_relaxed);
+        led.match = g_check_match.load(std::memory_order_relaxed);
+        led.mismatch = g_check_mismatch.load(std::memory_order_relaxed);
+        led.skipped = g_skipped.load(std::memory_order_relaxed);
+        const HopLedgerView v = view_ledger(led);
+        out += " queued=" + std::to_string(led.queued) + " consumed=" + std::to_string(led.consumed) +
+               " overwritten=" + std::to_string(led.overwritten) + " outstanding=" + std::to_string(v.outstanding) +
+               " check match=" + std::to_string(led.match) + " mismatch=" + std::to_string(led.mismatch) +
+               " pending=" + std::to_string(v.pending) + " skipped=" + std::to_string(led.skipped);
+        if (!v.arithmetic_ok) out += " ledger=bad";
+        else if (v.consumed_checked) out += " consumed_checked=1";
+        else out += " consumed_checked=0";
     }
     std::lock_guard<std::mutex> lk(g_mu);
     bool any = false;

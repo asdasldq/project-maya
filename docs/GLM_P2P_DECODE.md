@@ -23,13 +23,19 @@ MAYA_GLM_P2P_CHECK=1
 
 On each peer hop the producer stream also copies the residual into the existing pinned hop buffer before the event. After the consumer has installed the bounce, and before its layers, that stream copies its residual back out and compares it to the producer snapshot. The residual the layers read is not modified. The check adds one 64 KiB device-to-host copy each way and a host callback; it is for a correctness run, not a speed run. Host RAM for the consumer side is two 64 KiB buffers per boundary. No extra device memory beyond the bounce.
 
-After the reply the stat line has:
+After the reply the stat line has, once the consumer callbacks have been waited for:
 
 ```text
-glm p2p: runtime hops peer=N host=0 ... check match=M mismatch=0
+glm p2p: runtime hops peer=N host=0 ... queued=N consumed=C overwritten=R outstanding=U check match=C mismatch=0 pending=0 skipped=0 consumed_checked=1
 ```
 
-`mismatch=0` and `match` equal to the peer hop count means every checked consumer residual matched the producer snapshot. A mismatch line names the boundary, slot, and first byte offset. `check` absent from the line means this binary was not started with `MAYA_GLM_P2P_CHECK=1`. The load probe line should say `peer src-stream`.
+`queued` is every peer snapshot. A rejected draft writes the head-to-tail slot and the redo writes that same slot before the tail reads it: the first snapshot is `overwritten`, not a consumer that skipped the check. The request can also stop with one speculative handoff still `outstanding`. `consumed` is a residual the next GPU actually installed. `consumed_checked=1` with `pending=0` and `mismatch=0` means every installed residual matched its producer snapshot. `match` is not supposed to equal `queued`. A mismatch line names the boundary, slot, and first byte offset.
+
+On the rev2 log this arithmetic is 223 queued, 200 consumed, gap 23. That is 22 rejected drafts (40 drafted, 18 accepted) plus one speculative handoff left queued when the reply stopped, and the follow-up (8 of 8 drafts accepted) adds one more outstanding. The check callbacks that did run reported no byte mismatch. The text still differed from the host run. The same logs show different expert traffic on that first reply (peer: vram hit 86.74%, ram fetches 0.33/tok, promotions 0.36/tok, cpu lane 56.36/tok; host: 87.95%, 0.67, 0.67, 48.08). The hop check does not compare those two runs to each other. It only compares each consumer to its own producer. A different expert set can change the producer residual before the copy.
+
+Next distinction, only after this accounting build prints `consumed_checked=1` and `mismatch=0`: stop the server, then run the same temp-0 prompt twice with `MAYA_GLM_CPU_LANE=0`, once with `MAYA_GLM_P2P=0` and once with `MAYA_GLM_P2P=1` (check on). That turns the CPU expert lane off so timing cannot move experts between CPU and GPU. If the texts still differ, the divergence is not that lane. If they match, the earlier difference followed the lane's timing. Do not treat either result as a speed measurement.
+
+Do not start this through `maya.py` or `maya.sh`. Those rebuild `build/maya` from the tree and can replace the restored engine. Stop the running server first so two processes do not map the same weights. Point the existing `server.py` wrapper at `build-p2p-rev3/maya` only, and check that binary's sha256 before the request. Leave the restored official binary in place.
 
 Leave the running service on the previous binary until this one is started beside it. Roll back by exiting the process; `MAYA_GLM_P2P` unset or `0` does not enable peer access and does not run the check.
 
