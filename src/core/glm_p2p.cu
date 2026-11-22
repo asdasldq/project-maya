@@ -27,9 +27,11 @@ struct DevRestore {
 
 struct Pair {
     int state = 0;   // 0 unknown, 1 peer, -1 host
+    int home = -1;   // destination device: bounce[] lives there
     std::string why;
-    float* slot[kPeerSlots] = {};
+    float* slot[kPeerSlots] = {};   // destination bounce, one residual each
     size_t slot_bytes = 0;
+    unsigned char* got[kPeerSlots] = {};   // pinned consumer copy, only with MAYA_GLM_P2P_CHECK
     double probe_ms = 0;
     bool said_decode = false;
     bool said_window = false;
@@ -37,22 +39,59 @@ struct Pair {
     bool issue_peer[kPeerSlots] = {};
 };
 
+struct CheckCookie {
+    const unsigned char* ref = nullptr;
+    const unsigned char* got = nullptr;
+    size_t bytes = 0;
+    int src = 0, dst = 0, slot = 0;
+};
+
 std::mutex g_mu;
 Pair g_pair[kMaxDev][kMaxDev];
+CheckCookie g_cookie[kMaxDev][kMaxDev][kPeerSlots];
 std::atomic<uint64_t> g_peer_hops{0};
 std::atomic<uint64_t> g_host_hops{0};
 std::atomic<uint64_t> g_peer_bytes{0};
 std::atomic<uint64_t> g_host_bytes{0};
+std::atomic<uint64_t> g_check_match{0};
+std::atomic<uint64_t> g_check_mismatch{0};
+std::atomic<int> g_check_logged{0};
 
 bool dev_ok(int d) { return d >= 0 && d < kMaxDev; }
 
+bool check_on() {
+    static const bool on = env_value_on(std::getenv("MAYA_GLM_P2P_CHECK"));
+    return on;
+}
+
 void free_slots(Pair& p) {
+    if (p.home >= 0) cudaSetDevice(p.home);
     for (int i = 0; i < kPeerSlots; ++i) {
         if (p.slot[i] != nullptr) cudaFree(p.slot[i]);
+        if (p.got[i] != nullptr) cudaFreeHost(p.got[i]);
         p.slot[i] = nullptr;
+        p.got[i] = nullptr;
         p.issue_valid[i] = false;
     }
     p.slot_bytes = 0;
+}
+
+void check_cb(void* raw) {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const auto* c = static_cast<const CheckCookie*>(raw);
+    if (c == nullptr || c->ref == nullptr || c->got == nullptr || c->bytes == 0) return;
+    const size_t at = first_mismatch(c->ref, c->got, c->bytes);
+    if (at == c->bytes) {
+        g_check_match.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_check_mismatch.fetch_add(1, std::memory_order_relaxed);
+    if (g_check_logged.exchange(1, std::memory_order_relaxed) == 0) {
+        std::fprintf(stderr,
+                     "glm p2p: CHECK mismatch CUDA%d -> CUDA%d slot %d byte %zu (producer 0x%02x, consumer 0x%02x, %zu bytes)\n",
+                     c->src, c->dst, c->slot, at, c->ref[at], c->got[at], c->bytes);
+        std::fflush(stderr);
+    }
 }
 
 // Caller holds g_mu. Devices are restored. On failure the pair is host and slots are freed.
@@ -83,13 +122,18 @@ bool probe_unlocked(Pair& p, int src, int dst, size_t bytes) {
         (void) cudaGetLastError();
         return false;
     }
-    // The copy runs on the destination stream. The reverse enable is best-effort: some pairs only
-    // report one direction, and a failure here must not hide a forward path that already enabled.
+    // The runtime copy is a producer-stream peer write into destination memory. Enable the source
+    // to address the destination. The reverse enable stays best-effort.
     cudaSetDevice(src);
     pe = cudaDeviceEnablePeerAccess(dst, 0);
-    if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) (void) cudaGetLastError();
+    if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) {
+        p.why = std::string(HopReasons::kEnable) + ": " + cudaGetErrorString(pe);
+        (void) cudaGetLastError();
+        return false;
+    }
 
-    cudaSetDevice(src);
+    p.home = dst;
+    cudaSetDevice(dst);
     for (int i = 0; i < kPeerSlots; ++i) {
         if (cudaMalloc(&p.slot[i], bytes) != cudaSuccess) {
             (void) cudaGetLastError();
@@ -97,13 +141,20 @@ bool probe_unlocked(Pair& p, int src, int dst, size_t bytes) {
             p.why = HopReasons::kAlloc;
             return false;
         }
+        if (check_on() && cudaHostAlloc(&p.got[i], bytes, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "glm p2p: CUDA%d -> CUDA%d check buffer did not allocate; comparison off for this pair\n",
+                         src, dst);
+            std::fflush(stderr);
+            if (p.got[i] != nullptr) cudaFreeHost(p.got[i]);
+            p.got[i] = nullptr;
+        }
     }
     p.slot_bytes = bytes;
-    cudaSetDevice(dst);
-    void* probe_dst = nullptr;
-    if (cudaMalloc(&probe_dst, bytes) != cudaSuccess) {
+    cudaSetDevice(src);
+    void* src_tmp = nullptr;
+    if (cudaMalloc(&src_tmp, bytes) != cudaSuccess) {
         (void) cudaGetLastError();
-        cudaSetDevice(src);
         free_slots(p);
         p.why = HopReasons::kAlloc;
         return false;
@@ -113,16 +164,15 @@ bool probe_unlocked(Pair& p, int src, int dst, size_t bytes) {
     bool matched = true;
     std::string fail;
     double ms = 0;
+    // Same direction as the runtime hop: source memory, producer pushes into the destination bounce.
+    if (cudaMemcpy(src_tmp, host.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        fail = std::string(HopReasons::kProbe) + ": " + cudaGetErrorString(cudaGetLastError());
+        matched = false;
+    }
     for (int s = 0; s < kPeerSlots && matched; ++s) {
         cudaSetDevice(src);
-        if (cudaMemcpy(p.slot[s], host.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-            fail = std::string(HopReasons::kProbe) + ": " + cudaGetErrorString(cudaGetLastError());
-            matched = false;
-            break;
-        }
-        cudaSetDevice(dst);
         const auto t0 = std::chrono::steady_clock::now();
-        const cudaError_t ce = cudaMemcpyPeer(probe_dst, dst, p.slot[s], src, bytes);
+        const cudaError_t ce = cudaMemcpyPeer(p.slot[s], dst, src_tmp, src, bytes);
         const auto t1 = std::chrono::steady_clock::now();
         if (ce != cudaSuccess) {
             fail = std::string(HopReasons::kProbe) + ": " + cudaGetErrorString(ce);
@@ -131,20 +181,20 @@ bool probe_unlocked(Pair& p, int src, int dst, size_t bytes) {
             break;
         }
         ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-        if (cudaMemcpy(back.data(), probe_dst, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaSetDevice(dst);
+        if (cudaMemcpy(back.data(), p.slot[s], bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
             fail = std::string(HopReasons::kProbe) + ": " + cudaGetErrorString(cudaGetLastError());
             matched = false;
             break;
         }
-        if (std::memcmp(host.data(), back.data(), bytes) != 0) {
+        if (first_mismatch(host.data(), back.data(), bytes) != bytes) {
             fail = std::string(HopReasons::kProbe) + ": byte mismatch";
             matched = false;
         }
     }
-    cudaSetDevice(dst);
-    cudaFree(probe_dst);
+    cudaSetDevice(src);
+    cudaFree(src_tmp);
     if (!matched) {
-        cudaSetDevice(src);
         free_slots(p);
         p.why = fail.empty() ? HopReasons::kProbe : fail;
         p.state = -1;
@@ -152,7 +202,8 @@ bool probe_unlocked(Pair& p, int src, int dst, size_t bytes) {
     }
     p.state = 1;
     p.probe_ms = ms / kPeerSlots;
-    p.why = HopReasons::kPeer;
+    p.why = check_on() ? "peer src-stream" : HopReasons::kPeer;
+    if (check_on()) p.why += " check";
     return true;
 }
 
@@ -184,15 +235,6 @@ void count(bool peer, size_t bytes) {
         g_host_hops.fetch_add(1, std::memory_order_relaxed);
         g_host_bytes.fetch_add(bytes, std::memory_order_relaxed);
     }
-}
-
-// hop_out already counted a peer enqueue that hop_in could not run. The bytes went through the host.
-void recount_as_host(size_t bytes) {
-    if (g_peer_hops.load(std::memory_order_relaxed) > 0) g_peer_hops.fetch_sub(1, std::memory_order_relaxed);
-    const uint64_t pb = g_peer_bytes.load(std::memory_order_relaxed);
-    if (pb >= bytes) g_peer_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-    g_host_hops.fetch_add(1, std::memory_order_relaxed);
-    g_host_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 bool record_ev(cudaEvent_t ev, cudaStream_t stream, std::string& err) {
@@ -236,9 +278,10 @@ std::string prepare_split(const int* devs, int n, size_t hop_bytes) {
             p->state = -1;
             p->why = HopReasons::kBytes;
         }
-        if (p->state > 0) {
-            char tail[96];
-            std::snprintf(tail, sizeof(tail), "peer (%zu B probe matched, %.3f ms)", p->slot_bytes, p->probe_ms);
+            if (p->state > 0) {
+            char tail[128];
+            std::snprintf(tail, sizeof(tail), "peer src-stream (%zu B probe matched, %.3f ms%s)", p->slot_bytes,
+                          p->probe_ms, check_on() ? ", check" : "");
             out += tail;
         } else {
             out += "host (";
@@ -306,10 +349,19 @@ bool hop_out(int src_dev, int dst_dev, const float* src, size_t bytes, float* ho
     cudaSetDevice(src_dev);
     if (peer && slotp == nullptr) peer = false;
     if (peer) {
-        if (cudaMemcpyAsync(slotp, src, bytes, cudaMemcpyDeviceToDevice, src_stream) != cudaSuccess) {
+        // Push from the stream that just wrote the residual. The event below means the bounce holds
+        // those bytes, which is what the destination waits for.
+        if (cudaMemcpyPeerAsync(slotp, dst_dev, src, src_dev, bytes, src_stream) != cudaSuccess) {
             const std::string ce = cudaGetErrorString(cudaGetLastError());
-            latch_host(src_dev, dst_dev, ("peer snapshot failed: " + ce).c_str());
+            latch_host(src_dev, dst_dev, ("peer write failed: " + ce).c_str());
             peer = false;
+        } else if (check_on() && host != nullptr) {
+            if (cudaMemcpyAsync(host, src, bytes, cudaMemcpyDeviceToHost, src_stream) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "glm p2p: CUDA%d -> CUDA%d check snapshot failed; comparison skipped\n", src_dev,
+                             dst_dev);
+                std::fflush(stderr);
+            }
         }
     }
     if (!peer) {
@@ -368,29 +420,38 @@ bool hop_in(int src_dev, int dst_dev, float* dst, size_t bytes, float* host, cud
         return false;
     }
     if (mark_after_wait != nullptr && !record_ev(mark_after_wait, dst_stream, err)) return false;
-    bool fell_back = false;
     if (peer) {
-        if (cudaMemcpyPeerAsync(dst, dst_dev, slotp, src_dev, bytes, dst_stream) == cudaSuccess) return true;
-        const std::string ce = cudaGetErrorString(cudaGetLastError());
-        latch_host(src_dev, dst_dev, ("peer copy failed: " + ce).c_str());
-        // The snapshot is in the source slot. Move it through the host buffer on the source stream
-        // and wait for that second record. The wait already queued above completes first.
-        if (host == nullptr || src_stream == nullptr) {
-            err = "glm p2p: peer copy failed and the host fallback has no buffer";
+        unsigned char* got = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            Pair* p = pair_unlocked(src_dev, dst_dev);
+            if (p != nullptr && slot >= 0 && slot < kPeerSlots) got = p->got[slot];
+        }
+        // Local copy. The bounce already holds the residual: the event waited for the producer push.
+        if (cudaMemcpyAsync(dst, slotp, bytes, cudaMemcpyDeviceToDevice, dst_stream) != cudaSuccess) {
+            const std::string ce = cudaGetErrorString(cudaGetLastError());
+            latch_host(src_dev, dst_dev, ("bounce install failed: " + ce).c_str());
+            err = "glm p2p: the destination bounce did not install";
             return false;
         }
-        cudaSetDevice(src_dev);
-        if (cudaMemcpyAsync(host, slotp, bytes, cudaMemcpyDeviceToHost, src_stream) != cudaSuccess) {
-            err = std::string("glm p2p: host fallback out failed: ") + cudaGetErrorString(cudaGetLastError());
-            return false;
+        if (check_on() && got != nullptr && host != nullptr && dev_ok(src_dev) && dev_ok(dst_dev) && slot >= 0 &&
+            slot < kPeerSlots) {
+            if (cudaMemcpyAsync(got, dst, bytes, cudaMemcpyDeviceToHost, dst_stream) != cudaSuccess) {
+                (void) cudaGetLastError();
+            } else {
+                CheckCookie& c = g_cookie[src_dev][dst_dev][slot];
+                c.ref = reinterpret_cast<const unsigned char*>(host);
+                c.got = got;
+                c.bytes = bytes;
+                c.src = src_dev;
+                c.dst = dst_dev;
+                c.slot = slot;
+                std::atomic_thread_fence(std::memory_order_release);
+                if (cudaLaunchHostFunc(dst_stream, check_cb, &c) != cudaSuccess) (void) cudaGetLastError();
+            }
         }
-        if (!record_ev(ev, src_stream, err)) return false;
-        cudaSetDevice(dst_dev);
-        if (cudaStreamWaitEvent(dst_stream, ev, 0) != cudaSuccess) {
-            err = std::string("glm p2p: host fallback wait failed: ") + cudaGetErrorString(cudaGetLastError());
-            return false;
-        }
-        fell_back = true;
+        (void) src_stream;
+        return true;
     }
     if (host == nullptr) {
         err = "glm p2p: no host hop buffer";
@@ -401,7 +462,7 @@ bool hop_in(int src_dev, int dst_dev, float* dst, size_t bytes, float* host, cud
         err = std::string("glm p2p: host hop in failed: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
-    if (fell_back) recount_as_host(bytes);
+    (void) src_stream;
     return true;
 }
 
@@ -451,6 +512,10 @@ std::string stat_line() {
     const uint64_t hb = g_host_bytes.load(std::memory_order_relaxed);
     std::string out = "glm p2p: runtime hops peer=" + std::to_string(ph) + " host=" + std::to_string(hh) +
                       " (peer " + std::to_string(pb) + " B, host " + std::to_string(hb) + " B)";
+    if (check_on()) {
+        out += " check match=" + std::to_string(g_check_match.load(std::memory_order_relaxed)) +
+               " mismatch=" + std::to_string(g_check_mismatch.load(std::memory_order_relaxed));
+    }
     std::lock_guard<std::mutex> lk(g_mu);
     bool any = false;
     for (int s = 0; s < kMaxDev; ++s) {

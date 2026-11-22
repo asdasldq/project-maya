@@ -60,4 +60,14 @@ inline HopSelect select_hop(const HopDecision& d, int slot, int nslots, size_t b
     return {true, HopReasons::kPeer};
 }
 
+// Byte offset of the first difference, or n when the ranges are equal. The runtime check compares
+// the consumer's residual to the producer snapshot with this.
+inline size_t first_mismatch(const void* a, const void* b, size_t n) {
+    const auto* x = static_cast<const unsigned char*>(a);
+    const auto* y = static_cast<const unsigned char*>(b);
+    for (size_t i = 0; i < n; ++i)
+        if (x[i] != y[i]) return i;
+    return n;
+}
+
 }  // namespace strata::core::glmp2p

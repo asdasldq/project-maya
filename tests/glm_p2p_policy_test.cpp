@@ -50,6 +50,15 @@ static void test_probe_failures_stay_host() {
     CHECK(std::strcmp(peer.reason, gp::HopReasons::kPeer) == 0);
 }
 
+static void test_mismatch() {
+    const unsigned char a[] = {1, 2, 3, 4};
+    const unsigned char b[] = {1, 2, 9, 4};
+    CHECK(gp::first_mismatch(a, a, 4) == 4);
+    CHECK(gp::first_mismatch(a, b, 4) == 2);
+    CHECK(gp::first_mismatch(a, b, 0) == 0);
+    CHECK(gp::first_mismatch(nullptr, nullptr, 0) == 0);
+}
+
 static void test_slot_and_size() {
     const gp::HopDecision peer = gp::decide(true, true, true, true, true);
     CHECK(gp::select_hop(peer, 0, gp::kPeerSlots, 65536, 65536).peer);
@@ -69,6 +78,7 @@ int main() {
     test_env();
     test_default_is_host();
     test_probe_failures_stay_host();
+    test_mismatch();
     test_slot_and_size();
     if (g_fail != 0) {
         std::fprintf(stderr, "%d checks failed\n", g_fail);

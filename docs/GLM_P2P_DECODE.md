@@ -2,6 +2,37 @@
 
 Opt-in device-to-device handoff of the residual between GPUs during GLM-5.3-Flash decode. The host copy stays the default.
 
+## What a short prompt actually runs
+
+On a split, `prefill()` returns without doing work when the prompt is shorter than 32 tokens (`MAYA_GLM_PREFILL_MIN`, default 32). An 18-token prompt is forwarded one token at a time by `fast_token`, and every one of those tokens crosses the peer hop when `MAYA_GLM_P2P=1`. The first completion token is sampled from that prompt forward. A wrong residual on any of those hops changes the opening of the reply. Speculative decode (`spec_head` / `spec_tail`) uses the same hop for later tokens. This was not measured here; the 18-versus-32 cut is what the source does.
+
+## Ordering
+
+The first revision peer-read the source buffer from the destination stream after a cross-device event. A synchronous probe can still match on that machine: the probe waits until the copy finishes. The token path does not. The producer stream now peer-writes the residual straight into a 2-slot bounce on the destination (128 KiB on each GPU that receives a hop), records the hop event after that write, and the destination copies the bounce into its residual with an ordinary same-device copy. The event means the bytes have landed, which is the host hop's contract. The window path (`MAYA_GLM_SPEC_WIN`) is separate and is not what an 18-token prompt uses.
+
+A text difference between `MAYA_GLM_P2P=1` and `0` does not by itself prove a bad copy, and a matching opening does not by itself prove the bytes match. `MAYA_GLM_P2P_CHECK=1` compares them.
+
+## Byte check
+
+Set both:
+
+```sh
+MAYA_GLM_P2P=1
+MAYA_GLM_P2P_CHECK=1
+```
+
+On each peer hop the producer stream also copies the residual into the existing pinned hop buffer before the event. After the consumer has installed the bounce, and before its layers, that stream copies its residual back out and compares it to the producer snapshot. The residual the layers read is not modified. The check adds one 64 KiB device-to-host copy each way and a host callback; it is for a correctness run, not a speed run. Host RAM for the consumer side is two 64 KiB buffers per boundary. No extra device memory beyond the bounce.
+
+After the reply the stat line has:
+
+```text
+glm p2p: runtime hops peer=N host=0 ... check match=M mismatch=0
+```
+
+`mismatch=0` and `match` equal to the peer hop count means every checked consumer residual matched the producer snapshot. A mismatch line names the boundary, slot, and first byte offset. `check` absent from the line means this binary was not started with `MAYA_GLM_P2P_CHECK=1`. The load probe line should say `peer src-stream`.
+
+Leave the running service on the previous binary until this one is started beside it. Roll back by exiting the process; `MAYA_GLM_P2P` unset or `0` does not enable peer access and does not run the check.
+
 This was written against Maya **v1.1.74** (`861e211f0c9c5894ea9c8e6e033fe0b70bd5a94d`). It was not run on a V100. A 4x V100-SXM2 machine has to build it and check the logs below.
 
 ## What was wrong
@@ -24,7 +55,7 @@ At the end of the split load, each consecutive pair is probed:
 2. `cudaDeviceEnablePeerAccess` both ways (the reverse enable is best-effort).
 3. Two device slots of one residual (128 KiB on the source). A pattern is peer-copied into a temporary buffer and compared. The temporary buffer is freed.
 
-If that matches, a decode hop snapshots the residual into the slot on the source stream, records the same event as before, and the destination stream peer-copies the slot after it waits on that event. The next token on the source is not allowed to overwrite the live residual before the destination has read it, so the copy is not state-to-state. Slots are the same indexes the speculative path already double-buffers (`p & 1` and `spec_n_ & 1`).
+If that matches, the producer stream peer-writes the live residual into a 2-slot bounce allocated on the destination (128 KiB there), then records the hop event. The destination waits on that event and copies the bounce into its residual locally. The same slot indexes as the speculative host buffers are used (`p & 1`, `spec_n_ & 1`, and slot 0 for the single-buffer tail hop). The producer's next kernels are behind the peer write on its own stream, so they do not overwrite the residual early.
 
 If the probe fails, the slot does not fit (sequence id 2 or higher on the parallel path; only two slots), or `cudaMemcpyPeerAsync` fails to enqueue, that hop uses the existing pinned host buffer. A failed enqueue latches the pair to the host path for the rest of the process and says so on stderr. Slots already queued are not freed.
 
@@ -70,9 +101,9 @@ Keep the current server up until this binary is ready. Start it separately, with
 
 Startup, four cards, probe matched:
 
-```
-glm p2p: CUDA0->CUDA1 peer (65536 B probe matched, ... ms), CUDA1->CUDA2 peer ..., CUDA2->CUDA3 peer ...; MAYA_GLM_P2P=1
-glm split: layers [0, 13) on CUDA0, ... (CUDA0->CUDA1 peer ...)
+```text
+glm p2p: CUDA0->CUDA1 peer src-stream (65536 B probe matched, ... ms), ...; MAYA_GLM_P2P=1
+glm split: layers [0, 13) on CUDA0, ... (CUDA0->CUDA1 peer src-stream ...)
 ```
 
 A boundary that did not probe peer is named `host` and the reason (`cudaDeviceCanAccessPeer=0`, `cudaDeviceEnablePeerAccess failed`, `peer slot alloc failed`, `peer copy probe failed: ...`).
@@ -87,9 +118,11 @@ glm p2p: first runtime hop CUDA0 -> CUDA1 queued peer (decode, 65536 bytes, slot
 
 After the reply, next to `glm stat:`:
 
+```text
+glm p2p: runtime hops peer=N host=0 (peer ... B, host 0 B) check match=N mismatch=0; CUDA0->CUDA1 peer, ...
 ```
-glm p2p: runtime hops peer=N host=0 (peer ... B, host 0 B); CUDA0->CUDA1 peer, ...
-```
+
+`check match=` is present only with `MAYA_GLM_P2P_CHECK=1`. Without that variable the line has no check counts, and a matched load probe still does not say the consumer residual matched.
 
 For one 4-GPU sequence, `N` is 3 per token that crossed the split, and higher while speculative decode drafts and redoes. `host=0` with every boundary `peer` means the copies that ran were the peer path. `host` greater than 0 means at least one copy used the host buffer; the latch line says which pair.
 
@@ -107,4 +140,4 @@ If a generation faults after the probe (illegal address, a hang), treat that as 
 
 ## Not tested here
 
-No V100 and no CUDA runtime were available where this patch was built. The policy test checks the host default and the fallback rules only. Application, compile of `maya`, and generation checks belong on the server.
+No V100 and no CUDA runtime were available where this patch was written. The policy test checks the host default, the fallback rules, and the byte-compare helper only. It does not show that a consumer residual matches. That is `MAYA_GLM_P2P_CHECK=1` on the server. A previous run's token text is not a substitute for `mismatch=0`.

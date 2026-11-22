@@ -1,10 +1,15 @@
 // include/strata/core/glm_p2p.hpp - opt-in CUDA peer handoff for a GLM layer-split decode hop.
 //
-// MAYA_GLM_P2P=1 (off when unset). The token residual between two parts is snapshotted on the source
-// stream into a small device slot, then the destination stream peer-copies that slot after the source
-// event. Direct state-to-state is not used: the next token on the source can be queued before the
-// destination reads. The host pinned buffer remains the fallback when the pair was not probed peer,
-// the slot does not fit, or the peer copy fails to enqueue. Prefill hops are unchanged.
+// MAYA_GLM_P2P=1 (off when unset). The producer stream peer-writes the residual into a 2-slot bounce
+// buffer on the destination, records the same event as the host hop, and the destination stream copies
+// that bounce into its residual after the event. The event means the bytes have landed, the same
+// contract as the host D2H. A destination-side peer read is not used. The host pinned buffer remains
+// the fallback when the pair was not probed, the slot does not fit, or the copy fails to enqueue.
+// Prefill hops are unchanged.
+//
+// MAYA_GLM_P2P_CHECK=1 (off when unset) also snapshots the producer residual into the existing host hop
+// buffer and, on the consumer stream after the bounce is installed, compares those bytes. The stat line
+// then carries check match= / mismatch=. The compare does not change the residual.
 #pragma once
 
 #include "strata/core/glm_p2p_policy.hpp"
