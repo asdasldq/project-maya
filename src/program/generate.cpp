@@ -15,6 +15,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/glm_p2p.hpp"
 #include "strata/platform/env_alias.hpp"
 #include "strata/platform/idle_gate.hpp"
 #include "strata/platform/env_report.hpp"
@@ -2535,6 +2536,10 @@ static int glm_pack_generate(const Options& o) {
                          (double) (st2.cpu_experts - st1.cpu_experts) / n, (st2.cpu_ms - st1.cpu_ms) / n,
                          prompt_ms / (double) std::max<size_t>(1, prompt.size()), (long long) st2.pool_used,
                          (long long) st2.pool_slots, (long long) st2.ram_used, (long long) st2.ram_slots);
+            if (const std::string p2p = strata::core::glmp2p::stat_line(); !p2p.empty()) {
+                std::fprintf(stderr, "%s\n", p2p.c_str());
+                std::fflush(stderr);
+            }
             if (st2.disk_skips > st1.disk_skips)
                 std::fprintf(stderr, "glm skip: %.2f disk-only experts/tok left out (MAYA_GLM_DISK_SKIP_W / _FROM)\n",
                              (double) (st2.disk_skips - st1.disk_skips) / n);

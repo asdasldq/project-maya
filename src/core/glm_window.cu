@@ -16,6 +16,7 @@
 #include "glm_fast_state.hpp"
 #include "glm_residual.hpp"   // glm-dsa L1-4: the plain residual's embed / head for a window's rows
 #include "strata/core/glm_model.hpp"
+#include "strata/core/glm_p2p.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
 #include "strata/kernels/glm_fast.hpp"
@@ -62,14 +63,6 @@ struct KdaIn {
     float *proj[3], *fa, *ga, *beta;
 };
 
-static bool is_p2p_enabled() {
-    static const bool p2p_env = []() {
-        const char* val = std::getenv("MAYA_GLM_P2P");
-        return val != nullptr && std::atoi(val) != 0;
-    }();
-    return p2p_env;
-}
-
 static std::mutex p2p_mu;
 static float* p2p_slot_buf[16] = {};
 static size_t p2p_slot_bytes[16] = {};
@@ -89,30 +82,8 @@ static void free_p2p_buf(int dev) {
 }
 
 static bool enable_peer_cached(int dst_dev, int src_dev) {
-    if (dst_dev < 0 || dst_dev >= 16 || src_dev < 0 || src_dev >= 16 || dst_dev == src_dev) return false;
-    if (!is_p2p_enabled()) return false;
-    static std::atomic<int> peer_cache[16][16]{};   // 0: unknown, 1: enabled, -1: unsupported
-    int cached = peer_cache[dst_dev][src_dev].load(std::memory_order_acquire);
-    if (cached != 0) return cached > 0;
-    static std::mutex peer_mu;
-    std::lock_guard<std::mutex> lk(peer_mu);
-    cached = peer_cache[dst_dev][src_dev].load(std::memory_order_relaxed);
-    if (cached != 0) return cached > 0;
-    int can_peer = 0;
-    bool ok = false;
-    if (cudaDeviceCanAccessPeer(&can_peer, dst_dev, src_dev) == cudaSuccess && can_peer != 0) {
-        int cur_dev = 0;
-        cudaGetDevice(&cur_dev);
-        cudaSetDevice(dst_dev);
-        const cudaError_t pe = cudaDeviceEnablePeerAccess(src_dev, 0);
-        if (pe != cudaSuccess) (void) cudaGetLastError();
-        ok = (pe == cudaSuccess || pe == cudaErrorPeerAccessAlreadyEnabled);
-        cudaSetDevice(cur_dev);
-    } else {
-        (void) cudaGetLastError();
-    }
-    peer_cache[dst_dev][src_dev].store(ok ? 1 : -1, std::memory_order_release);
-    return ok;
+    // Same probe as the decode hop: the knob, both directions, and a matched copy. Off stays off.
+    return glmp2p::pair_ready(dst_dev, src_dev);
 }
 
 // A window's hyper-connections: one launch for all of a layer half's tokens (gf::hc_rows - each token the one-token
@@ -1269,12 +1240,25 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         auto& WA = tail->fast_->win;
         auto& WB = B->fast_->win;
         const size_t bytes = (size_t) T * hcE * sizeof(float);
+        bool used_peer = false;
         if (enable_peer_cached(B->dev_, tail->dev_)) {
             cudaSetDevice(tail->dev_);
             cudaEventRecord(WA.ev_hop, tail->fast_->cs);
             cudaSetDevice(B->dev_);
             cudaStreamWaitEvent(B->fast_->cs, WA.ev_hop, 0);
-            cudaMemcpyPeerAsync(WB.R[0], B->dev_, WA.R[WA.out], tail->dev_, bytes, B->fast_->cs);
+            if (cudaMemcpyPeerAsync(WB.R[0], B->dev_, WA.R[WA.out], tail->dev_, bytes, B->fast_->cs) == cudaSuccess) {
+                used_peer = true;
+            } else {
+                (void) cudaGetLastError();
+                glmp2p::latch_host(tail->dev_, B->dev_, "window peer copy failed");
+                // WA.R is still the source residual. The wait above already ordered it; copy through the host.
+                cudaSetDevice(tail->dev_);
+                cudaMemcpyAsync(WA.hop_h, WA.R[WA.out], bytes, cudaMemcpyDeviceToHost, tail->fast_->cs);
+                cudaEventRecord(WA.ev_hop, tail->fast_->cs);
+                cudaSetDevice(B->dev_);
+                cudaStreamWaitEvent(B->fast_->cs, WA.ev_hop, 0);
+                cudaMemcpyAsync(WB.R[0], WA.hop_h, bytes, cudaMemcpyHostToDevice, B->fast_->cs);
+            }
         } else {
             cudaSetDevice(tail->dev_);
             cudaMemcpyAsync(WA.hop_h, WA.R[WA.out], bytes, cudaMemcpyDeviceToHost, tail->fast_->cs);
@@ -1283,6 +1267,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
             cudaStreamWaitEvent(B->fast_->cs, WA.ev_hop, 0);
             cudaMemcpyAsync(WB.R[0], WA.hop_h, bytes, cudaMemcpyHostToDevice, B->fast_->cs);
         }
+        glmp2p::note(tail->dev_, B->dev_, used_peer, bytes, 0, "window", true);
         if (!B->fast_window_layers(p0, T, err)) return false;
         tail = B;
     }
@@ -1524,10 +1509,18 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     } else {
         cudaStreamWaitEvent(F->cs, prev->fast_->win.ev_tok[sl], 0);
         if (float* pbuf = get_p2p_buf(prev->dev_, m->dev_)) {
-            cudaMemcpyPeerAsync(m->state_, m->dev_, pbuf + (size_t) sl * hcE, prev->dev_, hcE * sizeof(float), F->cs);
+            if (cudaMemcpyPeerAsync(m->state_, m->dev_, pbuf + (size_t) sl * hcE, prev->dev_, hcE * sizeof(float),
+                                    F->cs) != cudaSuccess) {
+                (void) cudaGetLastError();
+                // Do not latch here: the producer thread may already have chosen peer for the next token.
+                err = "glm window: peer copy failed; restart with MAYA_GLM_P2P=0";
+                return false;
+            }
+            glmp2p::note(prev->dev_, m->dev_, true, hcE * sizeof(float), sl, "window", true);
         } else {
             cudaMemcpyAsync(m->state_, prev->fast_->win.hop_h + (size_t) sl * hcE, hcE * sizeof(float),
                             cudaMemcpyHostToDevice, F->cs);
+            glmp2p::note(prev->dev_, m->dev_, false, hcE * sizeof(float), sl, "window", true);
         }
     }
     W.pipe_t = t;

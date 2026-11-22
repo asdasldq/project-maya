@@ -13,6 +13,7 @@
 // for the oldest sequence's token (multi_take), and issues that sequence's next one right away.
 #include "glm_fast_state.hpp"
 #include "glm_residual.hpp"   // glm-dsa B2.3 (W6 fix)
+#include "strata/core/glm_p2p.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -236,12 +237,14 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
     for (Glm5Model* B = split_next_.get(); B != nullptr; B = B->split_next_.get()) {
         SeqCtx& ca = tail->seq_[(size_t) s];
         cudaSetDevice(tail->dev_);
-        cudaMemcpyAsync(ca.hop_h, tail->state_, hop, cudaMemcpyDeviceToHost, tail->fast_->cs);
-        cudaEventRecord(ca.ev_hop, tail->fast_->cs);
+        // Sequence ids past the two peer slots stay on that sequence's host buffer (the slot would alias).
+        if (!glmp2p::hop_out(tail->dev_, B->dev_, tail->state_, hop, ca.hop_h, tail->fast_->cs, ca.ev_hop, s, err))
+            return false;
         cudaSetDevice(B->dev_);
         B->pos_ = pos_;
-        cudaStreamWaitEvent(B->fast_->cs, ca.ev_hop, 0);
-        cudaMemcpyAsync(B->state_, ca.hop_h, hop, cudaMemcpyHostToDevice, B->fast_->cs);
+        if (!glmp2p::hop_in(tail->dev_, B->dev_, B->state_, hop, ca.hop_h, B->fast_->cs, tail->fast_->cs, ca.ev_hop, s,
+                            err))
+            return false;
         if (!B->fast_layers(p, true, err)) return false;
         tail = B;
     }
