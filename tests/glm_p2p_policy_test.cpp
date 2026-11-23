@@ -94,6 +94,10 @@ static void test_slot_and_size() {
     CHECK(std::strcmp(big.reason, gp::HopReasons::kBytes) == 0);
     CHECK(!gp::select_hop(peer, 0, gp::kPeerSlots, 0, 65536).peer);
     CHECK(!gp::select_hop(peer, -1, gp::kPeerSlots, 65536, 65536).peer);
+    // The pipe window's slot is bank * 16 + token. A sequence id of 2 still misses the decode limit.
+    CHECK(gp::select_hop(peer, 16, gp::kWindowSlots, 65536, 65536).peer);
+    CHECK(gp::select_hop(peer, 31, gp::kWindowSlots, 65536, 65536).peer);
+    CHECK(!gp::select_hop(peer, 32, gp::kWindowSlots, 65536, 65536).peer);
 }
 
 int main() {

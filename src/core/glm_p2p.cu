@@ -29,14 +29,14 @@ struct Pair {
     int state = 0;   // 0 unknown, 1 peer, -1 host
     int home = -1;   // destination device: bounce[] lives there
     std::string why;
-    float* slot[kPeerSlots] = {};   // destination bounce, one residual each
+    float* slot[kWindowSlots] = {};   // destination bounce, one residual each
     size_t slot_bytes = 0;
-    unsigned char* got[kPeerSlots] = {};   // pinned consumer copy, only with MAYA_GLM_P2P_CHECK
+    unsigned char* got[kWindowSlots] = {};   // pinned consumer copy, only with MAYA_GLM_P2P_CHECK
     double probe_ms = 0;
     bool said_decode = false;
     bool said_window = false;
-    bool issue_valid[kPeerSlots] = {};
-    bool issue_peer[kPeerSlots] = {};
+    bool issue_valid[kWindowSlots] = {};
+    bool issue_peer[kWindowSlots] = {};
 };
 
 struct CheckCookie {
@@ -48,7 +48,7 @@ struct CheckCookie {
 
 std::mutex g_mu;
 Pair g_pair[kMaxDev][kMaxDev];
-CheckCookie g_cookie[kMaxDev][kMaxDev][kPeerSlots];
+CheckCookie g_cookie[kMaxDev][kMaxDev][kWindowSlots];
 std::atomic<uint64_t> g_peer_hops{0};
 std::atomic<uint64_t> g_host_hops{0};
 std::atomic<uint64_t> g_peer_bytes{0};
@@ -71,7 +71,7 @@ bool check_on() {
 
 void free_slots(Pair& p) {
     if (p.home >= 0) cudaSetDevice(p.home);
-    for (int i = 0; i < kPeerSlots; ++i) {
+    for (int i = 0; i < kWindowSlots; ++i) {
         if (p.slot[i] != nullptr) cudaFree(p.slot[i]);
         if (p.got[i] != nullptr) cudaFreeHost(p.got[i]);
         p.slot[i] = nullptr;
@@ -207,6 +207,7 @@ bool probe_unlocked(Pair& p, int src, int dst, size_t bytes) {
     }
     p.state = 1;
     p.probe_ms = ms / kPeerSlots;
+    // Slots past the probe (the pipe window's bank * 16 + token) are allocated on first use.
     p.why = check_on() ? "peer src-stream" : HopReasons::kPeer;
     if (check_on()) p.why += " check";
     return true;
@@ -250,6 +251,30 @@ bool record_ev(cudaEvent_t ev, cudaStream_t stream, std::string& err) {
     if (cudaEventRecord(ev, stream) != cudaSuccess) {
         err = std::string("glm p2p: event record failed: ") + cudaGetErrorString(cudaGetLastError());
         return false;
+    }
+    return true;
+}
+
+// Caller holds g_mu. Slots [0, kPeerSlots) come from the probe. A pipe-window slot past those
+// is allocated here, on the destination, the first time it is used. A failed alloc does not
+// latch the pair, so decode slots 0/1 stay on the peer path.
+bool ensure_window_slot(Pair& p, int slot) {
+    if (slot < 0 || slot >= kWindowSlots) return false;
+    if (slot < kPeerSlots) return p.slot[slot] != nullptr;
+    if (p.slot[slot] != nullptr) return true;
+    if (p.state != 1 || p.home < 0 || p.slot_bytes == 0) return false;
+    DevRestore restore;
+    cudaSetDevice(p.home);
+    if (cudaMalloc(&p.slot[slot], p.slot_bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        p.slot[slot] = nullptr;
+        return false;
+    }
+    if (check_on() && p.got[slot] == nullptr) {
+        if (cudaHostAlloc(&p.got[slot], p.slot_bytes, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            p.got[slot] = nullptr;
+        }
     }
     return true;
 }
@@ -337,17 +362,21 @@ void note(int src_dev, int dst_dev, bool peer, size_t bytes, int slot, const cha
 }
 
 bool hop_out(int src_dev, int dst_dev, const float* src, size_t bytes, float* host, cudaStream_t src_stream,
-             cudaEvent_t ev, int slot, std::string& err) {
+             cudaEvent_t ev, int slot, std::string& err, int slot_limit, const char* where) {
     if (bytes == 0) return record_ev(ev, src_stream, err);
     bool peer = false;
     float* slotp = nullptr;
+    const int lim = slot_limit < 1 ? kPeerSlots : (slot_limit > kWindowSlots ? kWindowSlots : slot_limit);
     {
         std::lock_guard<std::mutex> lk(g_mu);
         Pair* p = pair_unlocked(src_dev, dst_dev);
         if (p != nullptr) {
             ensure_unlocked(*p, src_dev, dst_dev, bytes);
-            peer = select_hop(decision_of(*p), slot, kPeerSlots, bytes, p->slot_bytes).peer;
-            if (peer) slotp = p->slot[slot];
+            // A decode or sequence-id limit of 2 must not allocate a pipe-window slot.
+            const bool need_extra = slot >= kPeerSlots && slot < lim;
+            const bool slot_ok = !need_extra || ensure_window_slot(*p, slot);
+            peer = slot_ok && select_hop(decision_of(*p), slot, lim, bytes, p->slot_bytes).peer;
+            if (peer && slot >= 0 && slot < kWindowSlots) slotp = p->slot[slot];
         }
     }
     DevRestore restore;
@@ -381,7 +410,7 @@ bool hop_out(int src_dev, int dst_dev, const float* src, size_t bytes, float* ho
         }
     }
     if (!record_ev(ev, src_stream, err)) return false;
-    if (slot >= 0 && slot < kPeerSlots && dev_ok(src_dev) && dev_ok(dst_dev)) {
+    if (slot >= 0 && slot < lim && dev_ok(src_dev) && dev_ok(dst_dev)) {
         std::lock_guard<std::mutex> lk(g_mu);
         Pair& p = g_pair[src_dev][dst_dev];
         // A rejected draft writes this slot, then the redo writes it again before the tail reads.
@@ -392,25 +421,27 @@ bool hop_out(int src_dev, int dst_dev, const float* src, size_t bytes, float* ho
         p.issue_peer[slot] = peer;
     }
     if (peer) g_queued.fetch_add(1, std::memory_order_relaxed);
-    note(src_dev, dst_dev, peer, bytes, slot, "decode", true);
+    note(src_dev, dst_dev, peer, bytes, slot, where != nullptr ? where : "decode", true);
     return true;
 }
 
 bool hop_in(int src_dev, int dst_dev, float* dst, size_t bytes, float* host, cudaStream_t dst_stream,
-            cudaStream_t src_stream, cudaEvent_t ev, int slot, std::string& err, cudaEvent_t mark_after_wait) {
+            cudaStream_t src_stream, cudaEvent_t ev, int slot, std::string& err, cudaEvent_t mark_after_wait,
+            int slot_limit) {
     if (bytes == 0) return true;
     bool peer = false;
     bool issued = false;
     float* slotp = nullptr;
+    const int lim = slot_limit < 1 ? kPeerSlots : (slot_limit > kWindowSlots ? kWindowSlots : slot_limit);
     {
         std::lock_guard<std::mutex> lk(g_mu);
         Pair* p = pair_unlocked(src_dev, dst_dev);
-        if (slot >= 0 && slot < kPeerSlots && p != nullptr && p->issue_valid[slot]) {
+        if (slot >= 0 && slot < lim && p != nullptr && p->issue_valid[slot]) {
             peer = p->issue_peer[slot];
             issued = true;
             p->issue_valid[slot] = false;
             slotp = p->slot[slot];
-        } else if (slot < 0 || slot >= kPeerSlots) {
+        } else if (slot < 0 || slot >= lim) {
             peer = false;
             issued = true;   // both sides treat an out-of-range slot as the host buffer
         }
@@ -435,7 +466,7 @@ bool hop_in(int src_dev, int dst_dev, float* dst, size_t bytes, float* host, cud
         {
             std::lock_guard<std::mutex> lk(g_mu);
             Pair* p = pair_unlocked(src_dev, dst_dev);
-            if (p != nullptr && slot >= 0 && slot < kPeerSlots) got = p->got[slot];
+            if (p != nullptr && slot >= 0 && slot < lim) got = p->got[slot];
         }
         // Local copy. The bounce already holds the residual: the event waited for the producer push.
         if (cudaMemcpyAsync(dst, slotp, bytes, cudaMemcpyDeviceToDevice, dst_stream) != cudaSuccess) {
@@ -446,7 +477,7 @@ bool hop_in(int src_dev, int dst_dev, float* dst, size_t bytes, float* host, cud
         }
         bool launched = false;
         if (check_on() && got != nullptr && host != nullptr && dev_ok(src_dev) && dev_ok(dst_dev) && slot >= 0 &&
-            slot < kPeerSlots) {
+            slot < lim) {
             if (cudaMemcpyAsync(got, dst, bytes, cudaMemcpyDeviceToHost, dst_stream) != cudaSuccess) {
                 (void) cudaGetLastError();
             } else {

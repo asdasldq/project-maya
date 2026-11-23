@@ -891,6 +891,21 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
     }();
     double prof_draft = 0, prof_pick = 0, prof_commit = 0, prof_cache = 0, prof_round = 0;
     int64_t prof_rows = 0, prof_kept = 0, prof_chain = 0, prof_step = 0;
+    int64_t prof_hit[9] = {}, prof_try[9] = {};
+    // depth 1 hits/tries is position-1 acceptance. accepted/drafted is not: a miss stops the round.
+    const auto depth_note = [&](int depth, bool hit) {
+        if (!pipe_prof || depth < 1 || depth > 8) return;
+        ++prof_try[depth];
+        if (hit) ++prof_hit[depth];
+    };
+    // Same EMA decode_spec keeps. fast_mtp leaves the draft vocabulary once this crosses 0.02 on 3+ GPUs.
+    // The pipe used to skip this, so its drafts stayed on the subset for the whole request.
+    const auto vocab_note = [&](int tok) {
+        const std::vector<uint8_t>& vin = TL->mtp_vin_;
+        const bool outside = !vin.empty() && tok >= 0 && tok < (int) vin.size() && !vin[(size_t) tok];
+        TL->mtp_out_ += ((outside ? 1.0 : 0.0) - TL->mtp_out_) / 64.0;
+    };
+    vocab_note(y);
     // MAYA_GLM_WIN_COMMIT_WAIT=1: the parts' commits waited for (A/B; off: the next window queues behind them)
     static const bool commit_wait = [] {
         const char* v = getenv("MAYA_GLM_WIN_COMMIT_WAIT");
@@ -930,8 +945,10 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                 if (chain) {
                     for (int i = 0; i < n && ok; ++i) {
                         // glm-dsa L1-4: a later step's carrier is the step before's output (decode_mtp's rule)
+                        // sub stays false, as decode_spec. Forcing it kept the draft vocabulary after mtp_out_
+                        // crossed 2%, so the full-head verify rejected drafts the one-draft path would match.
                         if (i > 0 && g.arch == GlmArch::GlmDsa) TL->mtp_carry_note(N - 1 + i, FT->head_x, FT->cs);
-                        ok = TL->fast_mtp(N - 1 + i, i == 0 ? y : -1, err, i, true, false);
+                        ok = TL->fast_mtp(N - 1 + i, i == 0 ? y : -1, err, i, false, false);
                     }
                     if (ok) {
                         cudaMemcpyAsync(FT->mtp_tok_h, FT->mtp_tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost,
@@ -949,7 +966,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                     int32_t tok = y;
                     for (int i = 0; i < n && ok; ++i) {
                         if (i > 0 && g.arch == GlmArch::GlmDsa) TL->mtp_carry_note(N - 1 + i, FT->head_x, FT->cs);
-                        if (!TL->fast_mtp(N - 1 + i, tok, err, i, true) ||
+                        if (!TL->fast_mtp(N - 1 + i, tok, err, i, false) ||
                             !glmfast::wait_event(FT->ev_mtp, "glm spec pipe draft", err) ||
                             !TL->fast_->route_ok(err)) {
                             ok = false;
@@ -987,7 +1004,9 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                 if (t + 1 >= T) break;
                 mtp_hit_[t + 1] *= acc_keep;
                 mtp_reach_[t + 1] = mtp_reach_[t + 1] * acc_keep + 1.0;
-                if (out[(size_t) t] != winv[(size_t) t + 1]) break;
+                const bool hit = out[(size_t) t] == winv[(size_t) t + 1];
+                depth_note(t + 1, hit);
+                if (!hit) break;
                 mtp_hit_[t + 1] += 1.0;
                 ++acc;
             }
@@ -1002,7 +1021,9 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                 const int32_t want = (t == 0 && force_tok_ >= 0) ? force_tok_ : winv[(size_t) t + 1];
                 mtp_hit_[t + 1] *= acc_keep;
                 mtp_reach_[t + 1] = mtp_reach_[t + 1] * acc_keep + 1.0;
-                if (pick != want) {
+                const bool hit = pick == want;
+                depth_note(t + 1, hit);
+                if (!hit) {
                     win_pipe_cancel_from(t + 1);
                     break;
                 }
@@ -1030,7 +1051,9 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
         for (; kept < acc; ++kept) {
             sp.counter += 1;
             ++produced;
-            more = emit(forced(out[(size_t) kept])) && produced < max_new;
+            const int32_t tok_out = forced(out[(size_t) kept]);
+            vocab_note(tok_out);
+            more = emit(tok_out) && produced < max_new;
             if (!more || force_tok_ >= 0) {
                 ++kept;
                 break;
@@ -1096,6 +1119,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
         sp.counter += 1;   // (the anchor token: the request's counter as the token loop would have run it)
         ++produced;
         last_tok_ = y2;
+        vocab_note(y2);
         if (!emit(y2) || produced >= max_new || pos_ + 1 >= max_ctx_) break;
         y = y2;
         // ---- the next window's anchor begins now, behind the commit (on the earlier parts' crew threads; the last
@@ -1137,6 +1161,18 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                      "are not glm stat's cpu lane ms/tok (that sum adds every part).\n",
                      (long long) rounds, (long long) prof_rows, (long long) prof_kept, prof_draft / nr, prof_pick / nr,
                      prof_commit / nr, prof_cache / nr, prof_round / nr, (long long) prof_chain, (long long) prof_step);
+        std::fprintf(stderr, "glm pipe prof: depth hits/tries");
+        for (int d = 1; d <= 8; ++d) {
+            if (prof_try[d] == 0) continue;
+            std::fprintf(stderr, " %d:%lld/%lld", d, (long long) prof_hit[d], (long long) prof_try[d]);
+        }
+        std::fprintf(stderr, "\n");
+        if (FT->mtp_dv > 0)
+            std::fprintf(stderr,
+                         "glm pipe prof: draft vocab mtp_dv=%d mtp_dx=%d mtp_out=%.3f (subset while mtp_out stays under 0.02)\n",
+                         FT->mtp_dv, FT->mtp_dx, TL->mtp_out_);
+        else
+            std::fprintf(stderr, "glm pipe prof: draft vocab off (whole head)\n");
         std::fflush(stderr);
     }
     win_prof_report();

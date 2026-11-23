@@ -1,11 +1,13 @@
 // include/strata/core/glm_p2p.hpp - opt-in CUDA peer handoff for a GLM layer-split decode hop.
 //
-// MAYA_GLM_P2P=1 (off when unset). The producer stream peer-writes the residual into a 2-slot bounce
+// MAYA_GLM_P2P=1 (off when unset). The producer stream peer-writes the residual into a bounce
 // buffer on the destination, records the same event as the host hop, and the destination stream copies
 // that bounce into its residual after the event. The event means the bytes have landed, the same
-// contract as the host D2H. A destination-side peer read is not used. The host pinned buffer remains
-// the fallback when the pair was not probed, the slot does not fit, or the copy fails to enqueue.
-// Prefill hops are unchanged.
+// contract as the host D2H. A destination-side peer read is not used. Decode uses two slots. The
+// pipe window (MAYA_GLM_SPEC_WIN=1) uses bank * 16 + token, allocated on first use up to kWindowSlots.
+// The host pinned buffer remains the fallback when the pair was not probed, the slot does not fit,
+// or the copy fails to enqueue. Prefill hops are unchanged. The batched window (SPEC_WIN=2) is not
+// this path.
 //
 // MAYA_GLM_P2P_CHECK=1 (off when unset) also snapshots the producer residual into the existing host hop
 // buffer and, on the consumer stream after the bounce is installed, compares those bytes. The stat line
@@ -33,17 +35,19 @@ bool pair_ready(int dst_dev, int src_dev);
 // (a copy already queued may still read them).
 void latch_host(int src_dev, int dst_dev, const char* why);
 
-// Queue the snapshot on src_stream and record ev. slot 0/1 are the spec double-buffer; any other
-// index uses the host buffer (parallel sequence ids past the two slots).
+// Queue the snapshot on src_stream and record ev. slot_limit is kPeerSlots for decode and for a
+// parallel sequence id (past that, the host buffer). The pipe window passes kWindowSlots.
+// where is the first-runtime-hop label ("decode" or "window").
 bool hop_out(int src_dev, int dst_dev, const float* src, size_t bytes, float* host, cudaStream_t src_stream,
-             cudaEvent_t ev, int slot, std::string& err);
+             cudaEvent_t ev, int slot, std::string& err, int slot_limit = kPeerSlots,
+             const char* where = "decode");
 
 // Wait ev on dst_stream, then fill dst. mark_after_wait, when set, is recorded on dst_stream after
 // the wait and before the copy (MAYA_GLM_SPEC_PROF). src_stream is used only if the peer copy fails
-// and this hop falls back to the host buffer.
+// and this hop falls back to the host buffer. slot_limit must match the hop_out that wrote this slot.
 bool hop_in(int src_dev, int dst_dev, float* dst, size_t bytes, float* host, cudaStream_t dst_stream,
             cudaStream_t src_stream, cudaEvent_t ev, int slot, std::string& err,
-            cudaEvent_t mark_after_wait = nullptr);
+            cudaEvent_t mark_after_wait = nullptr, int slot_limit = kPeerSlots);
 
 // Reference step(): both sides idle. Peer memcpy of the residual, or the host vector if that fails.
 bool hop_sync(int src_dev, int dst_dev, float* dst, const float* src, size_t bytes, float* host, std::string& err);

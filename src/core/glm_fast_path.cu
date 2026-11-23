@@ -23,6 +23,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_helper_link.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/glm_mtp_subset.hpp"
 #include "strata/core/glm_prof.hpp"
 #include "strata/core/glm_p2p.hpp"
 #include "strata/core/glm_dsa_split.hpp"   // glm-dsa B6.3
@@ -7504,10 +7505,10 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     }();
     const bool sample_draft_on = mtp_sample_ != nullptr && F->spec_q != nullptr && step == 0;
     // (a two-GPU split: only where the caller asks for it, as up to v1.1.51 - its speculative decode drafts over the
-    // whole head, #860.)  3+ GPUs (decode_spec asks nothing): the draft vocabulary while the answer stays in it, the
-    // whole head while it does not - mtp_out_ (decode_spec keeps it) under decode_mtp's 2%.  One GPU: the caller's
-    // choice (decode_mtp's own rule on mtp_out_; mtp_draft asks for the vocabulary)
-    sub = (sub || (!full_head && !sample_draft_on && n_parts_ > 2 && mtp_out_ < 0.02)) && F->mtp_dv > 0;
+    // whole head, #860.)  3+ GPUs (decode_spec and decode_spec_pipe pass caller_sub false): the draft vocabulary
+    // while mtp_out_ stays under 2%, the whole head once the answer leaves it.  One GPU: the caller's choice
+    // (decode_mtp's own rule on mtp_out_; mtp_draft asks for the vocabulary).
+    sub = mtp_draft_subset(sub, full_head, sample_draft_on, n_parts_, mtp_out_, F->mtp_dv);
     mtp_hx_pos_ = -1;   // head_x becomes the block's own hidden state
     if (next_tok < 0) {
         if (F->mtp_emb == nullptr || step < 1) {

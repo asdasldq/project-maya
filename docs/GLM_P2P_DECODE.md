@@ -8,7 +8,7 @@ On a split, `prefill()` returns without doing work when the prompt is shorter th
 
 ## Ordering
 
-The first revision peer-read the source buffer from the destination stream after a cross-device event. A synchronous probe can still match on that machine: the probe waits until the copy finishes. The token path does not. The producer stream now peer-writes the residual straight into a 2-slot bounce on the destination (128 KiB on each GPU that receives a hop), records the hop event after that write, and the destination copies the bounce into its residual with an ordinary same-device copy. The event means the bytes have landed, which is the host hop's contract. The window path (`MAYA_GLM_SPEC_WIN`) is separate and is not what an 18-token prompt uses.
+The first revision peer-read the source buffer from the destination stream after a cross-device event. A synchronous probe can still match on that machine: the probe waits until the copy finishes. The token path does not. The producer stream now peer-writes the residual straight into a bounce on the destination, records the hop event after that write, and the destination copies the bounce into its residual with an ordinary same-device copy. The event means the bytes have landed, which is the host hop's contract. Decode uses two slots (128 KiB on each GPU that receives a hop). The pipe window (`MAYA_GLM_SPEC_WIN=1`) uses the same write: slot `bank * 16 + token`, allocated on first use, up to 32 slots. An 18-token prompt does not open that window. `MAYA_GLM_SPEC_WIN=2` (the batched window) still peer-reads and is not the path measured here.
 
 A text difference between `MAYA_GLM_P2P=1` and `0` does not by itself prove a bad copy, and a matching opening does not by itself prove the bytes match. `MAYA_GLM_P2P_CHECK=1` compares them.
 
@@ -39,14 +39,22 @@ Do not start this through `maya.py` or `maya.sh`. Those rebuild `build/maya` fro
 
 ## Window drafts versus one-draft decode
 
-`MAYA_GLM_SPEC_WIN=1` with `MAYA_GLM_MTP_FIXED=4` or `2` was not faster than `decode_spec` on the short prompts. K=2 cut the hops and left the reported CPU-lane ms/tok essentially unchanged, so that counter is not evidence that CPU experts are the wall-clock limit. `glm stat`'s cpu lane ms/tok adds every GPU part's own CPU compute and divides by output tokens. Parts overlap, so the sum is not the time a GPU waited. A window hop logged at slot 16 is the second pipeline bank's first token (`kPipeMax` is 16), one 64 KiB residual, not sixteen copies.
+`MAYA_GLM_SPEC_WIN=1` with `MAYA_GLM_MTP_FIXED=4` or `2` was not faster than `decode_spec` on the short prompts. K=2 cut the hops and left the reported CPU-lane ms/tok essentially unchanged, so that counter is not evidence that CPU experts are the wall-clock limit. `glm stat`'s cpu lane ms/tok adds every GPU part's own CPU compute and divides by output tokens. Parts overlap, so the sum is not the time a GPU waited. The pipe's host pick time includes waiting for the GPU. A window hop logged at slot 16 is the second pipeline bank's first token (`kPipeMax` is 16), one 64 KiB residual, not sixteen copies.
+
+On the medium run the pipe's accepted/drafted rate was about 3–6% against `decode_spec`'s 69% on the same greedy prompt. That is not dilution. Two disagreements with `decode_spec` were in the source:
+
+- The pipe called `fast_mtp` with the draft-vocabulary flag forced on, and it never updated `mtp_out_`. `decode_spec` passes the flag off and adds each emitted token to that EMA. On 3+ GPUs the draft stays on the subset only while the EMA is under 0.02, then uses the whole head. A subset id that is not the full-head argmax fails verification. The pipe now follows the same rule. Acceptance is unchanged: a draft is kept only when its token id equals the trunk's pick.
+- The pipe hop peer-read the source residual from the destination stream after a cross-device event. Decode no longer does that. The pipe hop is now the same producer-stream write into a destination bounce. `MAYA_GLM_P2P_CHECK=1` compares those hops too. A sequence id of 2 or more on the parallel path still uses the host copy (only two decode slots).
+
+`MAYA_GLM_MTP_KEEP` applies inside the NextN block on both paths. It was not the difference.
 
 `MAYA_GLM_PIPE_PROF=1` (off by default; leave it off for a speed run) prints, after the reply:
 
 - `glm cpu prof`: the sum and each part, plus the largest part. Compare the max-part ms/tok with the summed stat line.
 - On the window path only, `glm pipe prof`: this thread's ms/round in draft, pick, commit, and cache, plus rows queued and kept, and whether the draft chain waited once (`chain rounds`) or once per draft (`step rounds`).
+- `depth hits/tries`: position 1 is `1:hits/tries`. `accepted/drafted` is not that rate, because a miss ends the round. `draft vocab mtp_dv=` / `mtp_out=` says whether the subset is in use. `mtp_out` above 0.02 means later drafts use the whole head. `draft vocab off` means there was no subset.
 
-Use one warmed request of about 128–256 tokens after a throwaway of the same prompt, temp 0, thinking off, for `decode_spec` and for the window. Do not compare a cold start with a warm one. No speed claim follows from this instrumentation alone.
+Use one warmed request of about 128–256 tokens after a throwaway of the same prompt, temp 0, thinking off, for `decode_spec` and for the window. Confirm `cached_tokens` is 75 on the follow-up of the fixed prompt. Do not compare a cold start with a warm one. Leave `PIPE_PROF` and `P2P_CHECK` off for the speed number. No speed claim follows from this instrumentation alone.
 
 Leave the running service on the previous binary until this one is started beside it. Roll back by exiting the process; `MAYA_GLM_P2P` unset or `0` does not enable peer access and does not run the check.
 
@@ -70,11 +78,11 @@ At the end of the split load, each consecutive pair is probed:
 
 1. `cudaDeviceCanAccessPeer` from the destination to the source.
 2. `cudaDeviceEnablePeerAccess` both ways (the reverse enable is best-effort).
-3. Two device slots of one residual (128 KiB on the source). A pattern is peer-copied into a temporary buffer and compared. The temporary buffer is freed.
+3. Two device slots of one residual (128 KiB on the destination). A pattern is peer-copied into those slots and compared. The temporary source buffer is freed. Pipe-window slots past these two are not probed; they are the same size on the same device and are allocated on first use.
 
-If that matches, the producer stream peer-writes the live residual into a 2-slot bounce allocated on the destination (128 KiB there), then records the hop event. The destination waits on that event and copies the bounce into its residual locally. The same slot indexes as the speculative host buffers are used (`p & 1`, `spec_n_ & 1`, and slot 0 for the single-buffer tail hop). The producer's next kernels are behind the peer write on its own stream, so they do not overwrite the residual early.
+If that matches, the producer stream peer-writes the live residual into a bounce allocated on the destination, then records the hop event. The destination waits on that event and copies the bounce into its residual locally. Decode uses the same slot indexes as the speculative host buffers (`p & 1`, `spec_n_ & 1`, and slot 0 for the single-buffer tail hop): two slots, 128 KiB. The pipe window passes slot `bank * 16 + token` and allocates that slot on first use (up to 32). The producer's next kernels are behind the peer write on its own stream, so they do not overwrite the residual early.
 
-If the probe fails, the slot does not fit (sequence id 2 or higher on the parallel path; only two slots), or `cudaMemcpyPeerAsync` fails to enqueue, that hop uses the existing pinned host buffer. A failed enqueue latches the pair to the host path for the rest of the process and says so on stderr. Slots already queued are not freed.
+If the probe fails, the slot does not fit (sequence id 2 or higher on the parallel path; that path has only two slots), or `cudaMemcpyPeerAsync` fails to enqueue, that hop uses the existing pinned host buffer. A failed enqueue latches the pair to the host path for the rest of the process and says so on stderr. A pipe-window slot that fails to allocate does not latch the pair; that hop uses the host buffer and decode slots 0/1 stay peer. Slots already queued are not freed.
 
 Unset, empty, and `0` do not call the peer APIs. The split log stays exactly:
 

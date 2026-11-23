@@ -12,6 +12,9 @@
 namespace strata::core::glmp2p {
 
 inline constexpr int kPeerSlots = 2;
+// Pipe-window slot is bank * 16 + token (two banks). Decode and a parallel sequence id still
+// pass kPeerSlots, so a sequence id of 2 or more stays on the host copy.
+inline constexpr int kWindowSlots = 32;
 inline constexpr int kMaxDev = 16;
 // The split log when the knob is off. Byte-for-byte the line Maya printed before this path existed.
 inline constexpr const char* kHostSplitLog = "one 64 KB host hop per boundary per token";

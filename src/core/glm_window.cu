@@ -63,24 +63,6 @@ struct KdaIn {
     float *proj[3], *fa, *ga, *beta;
 };
 
-static std::mutex p2p_mu;
-static float* p2p_slot_buf[16] = {};
-static size_t p2p_slot_bytes[16] = {};
-
-static void free_p2p_buf(int dev) {
-    if (dev < 0 || dev >= 16) return;
-    std::lock_guard<std::mutex> lk(p2p_mu);
-    if (p2p_slot_buf[dev] != nullptr) {
-        int cur = 0;
-        cudaGetDevice(&cur);
-        cudaSetDevice(dev);
-        cudaFree(p2p_slot_buf[dev]);
-        p2p_slot_buf[dev] = nullptr;
-        p2p_slot_bytes[dev] = 0;
-        cudaSetDevice(cur);
-    }
-}
-
 static bool enable_peer_cached(int dst_dev, int src_dev) {
     // Same probe as the decode hop: the knob, both directions, and a matched copy. Off stays off.
     return glmp2p::pair_ready(dst_dev, src_dev);
@@ -445,7 +427,6 @@ void Glm5Model::win_free() {
     if (fast_->rep) cudaFree(fast_->rep);
     fast_->rep = nullptr;
     kda_bak_cur_ = false;
-    free_p2p_buf(dev_);
 }
 
 // tokens t0 .. t0 + T - 1 of the window (a staggered window's group; all of it: t0 0)
@@ -1419,7 +1400,9 @@ void Glm5Model::win_kda_rows(int il, int t, float** proj, float** fa, float** ga
 // win_pipe_settle (before window_commit) or win_pipe_end (every pick, the devices drained).
 // window_pipe's crew: a thread a part, each running its part's share of the window's tokens in order (win_pipe_part)
 // - the next part's thread waits until this one has RECORDED token t's hop event (`done`), then has its stream wait
-// on it (each token its own event: the threads run out of turn)
+// on it (each token its own event: the threads run out of turn). The hop is the decode hop: the producer
+// stream peer-writes the residual into a bounce on the destination (slot = bank * kPipeMax + t), and the
+// destination copies that bounce locally. A destination-side peer read is not used.
 struct Glm5Model::PipeCrew {
     struct Worker {
         std::thread th;
@@ -1473,55 +1456,19 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     auto& W = F->win;
     const int64_t p = fast_->win.p0 + t;
     const int sl = W.bank * kPipeMax + t;   // this window's slot of token t
-    const size_t needed_p2p_bytes = (size_t) kPipeSlots * hcE * sizeof(float);
-    auto get_p2p_buf = [&](int src_dev, int dst_dev) -> float* {
-        if (!enable_peer_cached(dst_dev, src_dev)) return nullptr;
-        std::lock_guard<std::mutex> lk(p2p_mu);
-        if (p2p_slot_buf[src_dev] != nullptr && p2p_slot_bytes[src_dev] < needed_p2p_bytes) {
-            int cur = 0;
-            cudaGetDevice(&cur);
-            cudaSetDevice(src_dev);
-            cudaFree(p2p_slot_buf[src_dev]);
-            p2p_slot_buf[src_dev] = nullptr;
-            p2p_slot_bytes[src_dev] = 0;
-            cudaSetDevice(cur);
-        }
-        if (p2p_slot_buf[src_dev] == nullptr) {
-            int cur = 0;
-            cudaGetDevice(&cur);
-            cudaSetDevice(src_dev);
-            if (cudaMalloc((void**) &p2p_slot_buf[src_dev], needed_p2p_bytes) == cudaSuccess) {
-                p2p_slot_bytes[src_dev] = needed_p2p_bytes;
-            } else {
-                (void) cudaGetLastError();
-                p2p_slot_buf[src_dev] = nullptr;
-                p2p_slot_bytes[src_dev] = 0;
-            }
-            cudaSetDevice(cur);
-        }
-        return p2p_slot_buf[src_dev];
-    };
+    const size_t hop_bytes = hcE * sizeof(float);
     cudaSetDevice(m->dev_);
     if (prev == nullptr) {
         cudaMemcpyAsync(W.emb + (size_t) sl * E, W.emb_h + (size_t) sl * E, (size_t) E * sizeof(float),
                         cudaMemcpyHostToDevice, F->cs);
         gf::embed_streams(W.emb + (size_t) sl * E, m->state_, E, F->cs);
     } else {
-        cudaStreamWaitEvent(F->cs, prev->fast_->win.ev_tok[sl], 0);
-        if (float* pbuf = get_p2p_buf(prev->dev_, m->dev_)) {
-            if (cudaMemcpyPeerAsync(m->state_, m->dev_, pbuf + (size_t) sl * hcE, prev->dev_, hcE * sizeof(float),
-                                    F->cs) != cudaSuccess) {
-                (void) cudaGetLastError();
-                // Do not latch here: the producer thread may already have chosen peer for the next token.
-                err = "glm window: peer copy failed; restart with MAYA_GLM_P2P=0";
-                return false;
-            }
-            glmp2p::note(prev->dev_, m->dev_, true, hcE * sizeof(float), sl, "window", true);
-        } else {
-            cudaMemcpyAsync(m->state_, prev->fast_->win.hop_h + (size_t) sl * hcE, hcE * sizeof(float),
-                            cudaMemcpyHostToDevice, F->cs);
-            glmp2p::note(prev->dev_, m->dev_, false, hcE * sizeof(float), sl, "window", true);
-        }
+        // Same contract as decode: wait for the producer-stream peer write, then a local copy.
+        // Slot is bank * kPipeMax + t, so two tokens in flight do not share a bounce.
+        if (!glmp2p::hop_in(prev->dev_, m->dev_, m->state_, hop_bytes,
+                            prev->fast_->win.hop_h + (size_t) sl * hcE, F->cs, prev->fast_->cs,
+                            prev->fast_->win.ev_tok[sl], sl, err, nullptr, glmp2p::kWindowSlots))
+            return false;
     }
     W.pipe_t = t;
     F->bnd_tokens.fetch_add(1, std::memory_order_relaxed);
@@ -1534,12 +1481,9 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     }
     if (m->split_next_) {
         gf::set_skip(nullptr);
-        if (float* pbuf = get_p2p_buf(m->dev_, m->split_next_->dev_)) {
-            cudaMemcpyAsync(pbuf + (size_t) sl * hcE, m->state_, hcE * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
-        } else {
-            cudaMemcpyAsync(W.hop_h + (size_t) sl * hcE, m->state_, hcE * sizeof(float), cudaMemcpyDeviceToHost, F->cs);
-        }
-        cudaEventRecord(W.ev_tok[sl], F->cs);
+        if (!glmp2p::hop_out(m->dev_, m->split_next_->dev_, m->state_, hop_bytes, W.hop_h + (size_t) sl * hcE, F->cs,
+                             W.ev_tok[sl], sl, err, glmp2p::kWindowSlots, "window"))
+            return false;
         return true;
     }
     // the last part: this token's pick now - its head row, the output GEMV, the argmax (or row t's draw at the
