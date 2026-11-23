@@ -268,8 +268,9 @@ void Glm5Model::mtp_draft_setup(bool chain) {
     if (F->ev_mtp_emb == nullptr)
         if (cudaEventCreateWithFlags(&F->ev_mtp_emb, cudaEventDisableTiming) != cudaSuccess)
             cudaGetLastError();
-    if (want && room && pack_emb_src_ != nullptr &&
-        (pack_emb_type_ == GGML_TYPE_Q6_K || pack_emb_type_ == GGML_TYPE_Q8_0) && g.n_embd % 256 == 0) {
+    const bool type_ok = pack_emb_type_ == GGML_TYPE_Q6_K || pack_emb_type_ == GGML_TYPE_Q8_0 ||
+                         pack_emb_type_ == GGML_TYPE_Q4_K;
+    if (want && room && pack_emb_src_ != nullptr && type_ok && g.n_embd % 256 == 0) {
         bool ok = cudaMalloc(&F->mtp_emb, tb) == cudaSuccess &&
                   cudaMemcpy(F->mtp_emb, pack_emb_src_, tb, cudaMemcpyHostToDevice) == cudaSuccess &&
                   F->mtp_emb_h != nullptr && F->ev_mtp_emb != nullptr;
@@ -298,6 +299,13 @@ void Glm5Model::mtp_draft_setup(bool chain) {
             std::fprintf(stderr, "glm mtp: CUDA%d token_embd did not set up on the device - the drafts go step by step\n",
                          dev_);
         }
+    } else if (forced) {
+        const char* why = pack_emb_src_ == nullptr ? "no token_embd"
+                           : !type_ok              ? "token_embd is not Q4_K, Q6_K, or Q8_0"
+                           : g.n_embd % 256 != 0   ? "n_embd is not a multiple of 256"
+                                                   : "no room";
+        std::fprintf(stderr, "glm mtp: CUDA%d MAYA_GLM_MTP_CHAIN=1 left drafts step by step (%s, type %d)\n", dev_, why,
+                     pack_emb_type_);
     }
     const int n = F->mtp_dv + F->mtp_dx;
     if (F->mtp_dv > 0)

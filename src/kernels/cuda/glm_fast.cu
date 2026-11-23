@@ -6,6 +6,7 @@
 // serial reference kernels - the values agree to float rounding, which the fast-vs-reference check in
 // glm_pack_test pins on the real model.
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/core/q4k_row.hpp"
 #include "strata/kernels/glm_batch.hpp"   // mla_decode_v70 (Volta)
 #include "strata/kernels/exl3.hpp"
 #if defined(STRATA_USE_HIP)
@@ -5609,7 +5610,8 @@ __global__ void rows_q8_kernel(const float* __restrict__ x, int ld, int rows, in
 // ---------------------------------------------------------------- the NextN block's glue
 // A chained draft's embedding row: row *tok of token_embd kept on the device, the token the previous draft step's argmax
 // left there.  Dequantized as ggml's to_float does it, so the floats are the host's bit for bit: Q6_K d * scale * q (the
-// two products in that order, dequantize_row_q6_K), Q8_0 q * d.  One thread a value.
+// two products in that order, dequantize_row_q6_K), Q8_0 q * d, Q4_K (d * sc) * nibble - (dmin * mn).  One thread a value.
+// Any other type writes zeros; the chain setup compares a row and refuses the chain.
 __global__ void embed_tok_kernel(const void* __restrict__ table, int type, int n_rows, const int* __restrict__ tok,
                                  int n_embd, float* __restrict__ out) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
@@ -5619,9 +5621,20 @@ __global__ void embed_tok_kernel(const void* __restrict__ table, int type, int n
         out[e] = 0.0f;
         return;
     }
-    if (type == 8) {
+    if (type == 8) {   // GGML_TYPE_Q8_0
         const block_q8_0* b = (const block_q8_0*) table + (size_t) t * (n_embd / QK8_0) + e / QK8_0;
         out[e] = (float) b->qs[e % QK8_0] * __half2float(b->d);
+        return;
+    }
+    if (type == 12) {   // GGML_TYPE_Q4_K. UD-IQ1_S keeps token_embd in this type.
+        const uint8_t* raw = (const uint8_t*) table + ((size_t) t * (n_embd / 256) + (size_t) (e / 256)) * sizeof(block_q4_K);
+        const float d = __half2float(*reinterpret_cast<const __half*>(raw));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(raw + 2));
+        out[e] = strata::core::q4k_elem(raw, e % 256, d, dmin);
+        return;
+    }
+    if (type != 14) {   // GGML_TYPE_Q6_K
+        out[e] = 0.0f;
         return;
     }
     // Q6_K: 256 values a block in two halves of 128, each four runs of 32 (ggml-quants.c's loop order)

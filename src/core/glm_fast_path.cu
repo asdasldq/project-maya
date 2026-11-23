@@ -1239,12 +1239,17 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (ws_map_.at("output.weight").type < (int) GGML_TYPE_COUNT) mtp_draft_setup(false);
         }
     }
-    // (the draft vocabulary's rows for the speculative decode on a split of 3+ GPUs; a two-GPU split drafts over the
-    // whole head, as up to v1.1.51 - #860)
+    // The draft vocabulary's rows for speculative decode on a split of 3+ GPUs. A two-GPU split drafts
+    // over the whole head, as up to v1.1.51 (#860). The device chain stays off unless MAYA_GLM_MTP_CHAIN=1:
+    // token_embd is uploaded before the expert pool, and only when its type is Q4_K, Q6_K, or Q8_0 and a
+    // few rows match the host dequantizer. Unset keeps the step path, which pushes each draft while the
+    // next one runs.
     if (mtp_il_ >= 0 && F->mtp_dv == 0 && F->mtp_emb_h == nullptr && n_parts_ != 2 &&
         ws_map_.find("output.weight") != ws_map_.end() &&
         ws_map_.at("output.weight").type < (int) GGML_TYPE_COUNT) {
-        mtp_draft_setup(false);
+        const char* ce = std::getenv("MAYA_GLM_MTP_CHAIN");
+        const bool chain_ask = ce != nullptr && std::atoi(ce) != 0;
+        mtp_draft_setup(chain_ask);
     }
     {
         size_t f1 = 0, t1 = 0;

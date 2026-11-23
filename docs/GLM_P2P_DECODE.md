@@ -48,6 +48,16 @@ On the medium run the pipe's accepted/drafted rate was about 3–6% against `dec
 
 `MAYA_GLM_MTP_KEEP` applies inside the NextN block on both paths. It was not the difference.
 
+## Draft chain
+
+`MAYA_GLM_MTP_CHAIN` does not turn the chain on for a 4-GPU split when it is unset, and `=1` used to be ignored there: the split setup called the drafter with the chain flag forced off, so `token_embd` was never uploaded and every round stayed `step`. On UD-IQ1_S the embedding is Q4_K, which the device row reader did not dequantize.
+
+`MAYA_GLM_MTP_CHAIN=1` now asks for the upload. It runs only when the embedding is Q4_K, Q6_K, or Q8_0, `n_embd` is a multiple of 256, the allocation succeeds, and four device rows match the host dequantizer bit for bit. Otherwise the log says the drafts stay step by step and the step path is unchanged. Unset does not upload. The table is allocated on the tail before the expert pool (Q4_K at 154880 by 4096 is about 357 MB), so a chain that fits still leaves fewer resident experts.
+
+The chain queues every draft, then reads the ids back once, then pushes the window. The step path pushes each draft while the next draft runs, so the earlier GPUs are already in the window. A smaller draft-phase time is not by itself a faster reply. Compare engine tok/s and `ram fetches` on the same warmed 256-token prompt. Leave the standing service on the step path until that run is faster.
+
+`MAYA_GLM_MTP_FIXED` unset is the existing length search (`MAYA_GLM_MTP_ADAPT` stays at its default). It does not need this patch. Cap it with `MAYA_GLM_MTP_DRAFT=4`. One traced run shows the length each round; the speed run leaves the trace off. Verification is the same: a draft is kept only when its id matches the trunk pick.
+
 `MAYA_GLM_PIPE_PROF=1` (off by default; leave it off for a speed run) prints, after the reply:
 
 - `glm cpu prof`: the sum and each part, plus the largest part. Compare the max-part ms/tok with the summed stat line.
