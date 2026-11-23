@@ -15,6 +15,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/glm_p2p.hpp"
 #include "strata/platform/env_alias.hpp"
 #include "strata/platform/idle_gate.hpp"
 #include "strata/platform/env_report.hpp"
@@ -52,6 +53,7 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/core/mtp_rows.hpp"
 #include "strata/core/split_groups.hpp"
+#include "strata/core/answer_ckpt.hpp"
 #include "strata/core/prefix_cut.hpp"
 #include "strata/core/prefill_pieces.hpp"
 #include "strata/core/prefill_gaps.hpp"
@@ -1805,12 +1807,17 @@ static int glm_pack_generate(const Options& o) {
     // prompt[0, p) for a p the read went past - glm-dsa's positional state, Glm5Model::ckpt_save_at; glm-dsa has no
     // snapshot buffers to copy either, so a from_snapshot checkpoint there is the position p too)
     const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p, bool from_snapshot = false,
-                               bool at_pos = false) {
+                               bool at_pos = false, int protect = -1) {
         if ((int) ckpts.size() < ckpt_max) ckpts.emplace_back();
-        size_t c = 0;
+        size_t c = ckpts.size();
         for (size_t i = 0; i < ckpts.size(); ++i) {
+            if ((int) i == protect) continue;
             if (ckpts[i].tokens.empty()) { c = i; break; }
-            if (ckpts[i].used < ckpts[c].used) c = i;
+            if (c == ckpts.size() || ckpts[i].used < ckpts[c].used) c = i;
+        }
+        if (c == ckpts.size()) {
+            std::fprintf(stderr, "glm checkpoints: not kept at %zu (no free slot)\n", p);
+            return;
         }
         std::string e;
         ckpts[c].tokens.clear();
@@ -1824,6 +1831,30 @@ static int glm_pack_generate(const Options& o) {
         }
         ckpts[c].tokens.assign(prompt.begin(), prompt.begin() + (long) p);
         ckpts[c].used = ++ckpt_clock;
+    };
+    // The live snapshot is a real per-part KDA copy (snap_), named by snap_tokens. Copy that state into a
+    // checkpoint before something else replaces it. protect is a slot that must not be the victim (the checkpoint
+    // about to be restored). A metadata-only entry is not written: ckpt_save_snapshot copies snap_.
+    const auto keep_earlier_snapshot = [&](const std::vector<int32_t>& base, size_t before, int protect) {
+        if (ckpt_max <= 0 || !cur_img_pos.empty() || snap_tokens.empty()) return;
+        if (snap_tokens.size() >= before || snap_tokens.size() >= 512 || snap_tokens.size() > base.size()) return;
+        if (!std::equal(snap_tokens.begin(), snap_tokens.end(), base.begin())) return;
+        for (const auto& c : ckpts)
+            if (c.tokens.size() == snap_tokens.size() &&
+                std::equal(c.tokens.begin(), c.tokens.end(), snap_tokens.begin()))
+                return;
+        const size_t earlier = snap_tokens.size();
+        const auto t_copy = std::chrono::steady_clock::now();
+        ckpt_keep(base, earlier, true, false, protect);
+        model.ckpt_join();
+        bool held = false;
+        for (const auto& c : ckpts)
+            held = held || (c.tokens.size() == earlier &&
+                            std::equal(c.tokens.begin(), c.tokens.end(), base.begin()));
+        if (!held) return;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_copy).count();
+        std::fprintf(stderr, "glm checkpoints: kept the earlier snapshot at %zu before %zu (%.0f ms)\n", earlier,
+                     before, ms);
     };
     // A route that found a non-finite score (or an expert id out of range) means a NaN or an infinity in the state the
     // request ran on: its conversation must not be served again.  The kept snapshot and every slot this prompt
@@ -1910,16 +1941,24 @@ static int glm_pack_generate(const Options& o) {
                 if (reuse > 0) ckpt_drop_past(0);   // another conversation's state now
             }
             if (reuse > 0) {
-            } else if (model.ckpt_restore(ckpt_base + ck, ce)) {
-                reuse = ck_len;
-                from_ckpt = true;
-                ckpts[(size_t) ck].used = ++ckpt_clock;
-                snap_tokens.clear();   // the snapshot's position lies past the checkpoint: overwritten from here on
-                std::fprintf(stderr, "glm checkpoints: %zu of the prompt's %zu tokens from a checkpoint\n", reuse,
-                             prompt.size());
             } else {
-                std::fprintf(stderr, "glm checkpoints: %s\n", ce.c_str());
-                ckpts[(size_t) ck].tokens.clear();
+                const auto t_restore = std::chrono::steady_clock::now();
+                if (model.ckpt_restore(ckpt_base + ck, ce)) {
+                    reuse = ck_len;
+                    from_ckpt = true;
+                    ckpts[(size_t) ck].used = ++ckpt_clock;
+                    // A shorter device snapshot (the 75-token prompt prefix) is still in snap_. clear() drops its
+                    // name, and the later overwrite never sees it, so an edited turn then matches nothing. Copy the
+                    // state first. The slot just restored is protected.
+                    keep_earlier_snapshot(prompt, ck_len, ck);
+                    snap_tokens.clear();
+                    std::fprintf(stderr, "glm checkpoints: %zu of the prompt's %zu tokens from a checkpoint (%.0f ms)\n",
+                                 reuse, prompt.size(),
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_restore).count());
+                } else {
+                    std::fprintf(stderr, "glm checkpoints: %s\n", ce.c_str());
+                    ckpts[(size_t) ck].tokens.clear();
+                }
             }
         }
         // glm-dsa B14.14: the conversation in the model goes to the NVMe prompt cache before this prompt overwrites it
@@ -2121,8 +2160,10 @@ static int glm_pack_generate(const Options& o) {
                 if (gap_reset) gap_reset();   // (a gap's failure: the reset multi_fail left for after the read)
                 return 1;
             }
-            // a call the prompt path did not take (fewer tokens than MAYA_GLM_PREFILL_MIN: false, no error) leaves the
-            // rest to the token path below - from where the prompt path stopped, not from `reuse`
+            // a call the prompt path did not take (fewer tokens than MAYA_GLM_PREFILL_MIN, or a chunk under 256
+            // tokens whose layout does not fit: false, no error) leaves the rest to the token path below - from
+            // where the prompt path stopped, not from `reuse`.  A CUDA error, a lend, or a 256-token layout miss
+            // sets err and ends the request.
             i_first = at;
             if (pok) {
                 i_first = snap_at;
@@ -2188,6 +2229,11 @@ static int glm_pack_generate(const Options& o) {
             strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
             strata::core::progress_beat();
             if (model.fast() && !snapped && i == snap_at) {
+                // The live snapshot is about to move to this prompt's assistant header. A shorter prefix of the
+                // same ids (the previous turn's 75) would otherwise exist only until this overwrite, and the next
+                // request that still starts there — but not with this whole prompt — would read from token 0.
+                // Keep that prefix as a checkpoint first. The bytes copied are the snapshot's, not the live state.
+                keep_earlier_snapshot(prompt, snap_at, -1);
                 if (model.snapshot_save()) {
                     snap_tokens.assign(prompt.begin(), prompt.begin() + (long) snap_at);
                     snap_img_hash = img_hash(snap_tokens.size());
@@ -2319,6 +2365,11 @@ static int glm_pack_generate(const Options& o) {
         if (stop_req.load()) finish = "cancel";
         const auto t1 = std::chrono::steady_clock::now();
         const auto st1 = model.fast_stats();
+        uint64_t cpu_us0[8] = {};
+        int cpu_dev0[8] = {};
+        int cpu_n0 = 0;
+        if (const char* pp = std::getenv("MAYA_GLM_PIPE_PROF"); pp != nullptr && std::atoi(pp) != 0)
+            cpu_n0 = model.cpu_us_snap(cpu_us0, cpu_dev0, 8);
         const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;   // (the drafts this request so far: STAT, DONE)
         int64_t produced = 0;
         // one emitted token: the T line, the live tier counters every 8 tokens, the stop conditions (false: stop)
@@ -2519,6 +2570,33 @@ static int glm_pack_generate(const Options& o) {
                     reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
         std::fflush(stdout);
         if (pause_req.load() && std::strcmp(finish, "cancel") == 0) pause_snapshot(prompt, emitted, pause_keep.load());
+        // The prompt snapshot stays where this request put it: before the assistant turn (a 76-token
+        // prompt keeps 75). The decode feeds every written token except the last, so that prefix is a
+        // real state. Keep it as a checkpoint. A later prompt that starts with those ids restores it
+        // and reads only the rest; one that diverges earlier still uses the short snapshot.
+        if (std::strcmp(finish, "cancel") != 0 && ckpt_max > 0 && cur_img_pos.empty() && !model.ablating()) {
+            const size_t keep = strata::core::answer_ckpt_len(prompt.size(), emitted.size(), model.position());
+            if (keep > prompt.size()) {
+                std::vector<int32_t> held;
+                held.reserve(keep);
+                held.insert(held.end(), prompt.begin(), prompt.end());
+                held.insert(held.end(), emitted.begin(), emitted.begin() + (long) (keep - prompt.size()));
+                ckpt_keep(held, keep);
+                bool held_ok = false;
+                for (const auto& c : ckpts)
+                    held_ok = held_ok || (c.tokens.size() == keep &&
+                                          std::equal(c.tokens.begin(), c.tokens.end(), held.begin()));
+                if (held_ok) {
+                    std::fprintf(stderr, "glm checkpoints: answer kept at %zu tokens (%zu written, prompt %zu)\n",
+                                 keep, emitted.size(), prompt.size());
+                    // The device snapshot is still the prompt prefix. The next exact history restores the answer
+                    // checkpoint and would otherwise forget this prefix. Copy it now, after DONE.
+                    keep_earlier_snapshot(held, keep, -1);
+                }
+            } else if (emitted.size() > 1)
+                std::fprintf(stderr, "glm checkpoints: answer not kept (position %lld, prompt %zu, written %zu)\n",
+                             (long long) model.position(), prompt.size(), emitted.size());
+        }
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
         if (model.fast()) model.save_usage();
         if (model.fast() && produced > 0) {
@@ -2535,6 +2613,11 @@ static int glm_pack_generate(const Options& o) {
                          (double) (st2.cpu_experts - st1.cpu_experts) / n, (st2.cpu_ms - st1.cpu_ms) / n,
                          prompt_ms / (double) std::max<size_t>(1, prompt.size()), (long long) st2.pool_used,
                          (long long) st2.pool_slots, (long long) st2.ram_used, (long long) st2.ram_slots);
+            if (cpu_n0 > 0) model.log_cpu_prof(cpu_us0, cpu_dev0, cpu_n0, n);
+            if (const std::string p2p = strata::core::glmp2p::stat_line(); !p2p.empty()) {
+                std::fprintf(stderr, "%s\n", p2p.c_str());
+                std::fflush(stderr);
+            }
             if (st2.disk_skips > st1.disk_skips)
                 std::fprintf(stderr, "glm skip: %.2f disk-only experts/tok left out (MAYA_GLM_DISK_SKIP_W / _FROM)\n",
                              (double) (st2.disk_skips - st1.disk_skips) / n);

@@ -30,6 +30,7 @@
 #include "glm_rows_state.hpp"
 
 #include "strata/core/mtp_rows.hpp"
+#include "strata/core/glm_p2p.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -970,14 +971,16 @@ bool Glm5Model::multi_issue_rows(const int* seqs, const int32_t* tokens,
         cudaSetDevice(tail->dev_);
         for (int i = 0; i < n; ++i) {
             SeqCtx& ca = tail->seq_[(size_t) seqs[i]];
-            cudaMemcpyAsync(ca.hop_h, cur[i].state, hop, cudaMemcpyDeviceToHost, tail->fast_->cs);
-            cudaEventRecord(ca.ev_hop, tail->fast_->cs);
+            if (!glmp2p::hop_out(tail->dev_, B->dev_, cur[i].state, hop, ca.hop_h, tail->fast_->cs, ca.ev_hop, seqs[i],
+                                 err))
+                return false;
         }
         cudaSetDevice(B->dev_);
         for (int i = 0; i < n; ++i) {
             SeqCtx& ca = tail->seq_[(size_t) seqs[i]];
-            cudaStreamWaitEvent(B->fast_->cs, ca.ev_hop, 0);
-            cudaMemcpyAsync(nxt[i].state, ca.hop_h, hop, cudaMemcpyHostToDevice, B->fast_->cs);
+            if (!glmp2p::hop_in(tail->dev_, B->dev_, nxt[i].state, hop, ca.hop_h, B->fast_->cs, tail->fast_->cs,
+                                ca.ev_hop, seqs[i], err))
+                return false;
         }
         if (!B->rows_layers(nxt, n, err)) return false;
         for (int i = 0; i < n; ++i) cur[i] = nxt[i];

@@ -34,6 +34,7 @@
 #include "glm_rows_state.hpp"
 
 #include "strata/core/mtp_rows.hpp"
+#include "strata/core/glm_p2p.hpp"
 #include "strata/core/glm_maya_sync.hpp"   // glm-dsa: glm_rows_ok (these rows are Flash kernels)
 #include "strata/kernels/sampler.hpp"
 
@@ -385,9 +386,13 @@ bool Glm5Model::mtpw_part(const int* seqs, const int* counts, int n, const int32
                 cudaStreamWaitEvent(s, prev->mtpw_->ev_row[(size_t) sq * (size_t) W + (size_t) t], 0);
             if (prev->mtpw_->ev_row.empty())
                 cudaStreamWaitEvent(s, prev->mtpw_->ev_hop[(size_t) sq], 0);
-            for (int t = 0; t < counts[c]; ++t)
+            for (int t = 0; t < counts[c]; ++t) {
                 cudaMemcpyAsync(rw[row + t].res, prev->mtpw_->hop_h[(size_t) sq] + (size_t) t * hcE, hcE * sizeof(float),
                                 cudaMemcpyHostToDevice, s);
+                // These window rows stay on the host copy (one buffer holds the whole window). Count them so a
+                // peer plan is not mistaken for this path.
+                glmp2p::note(prev->dev_, dev_, false, hcE * sizeof(float), sq, "mtp-rows", false);
+            }
         }
     }
     if (!rows_layers(rw, nr, err)) return false;

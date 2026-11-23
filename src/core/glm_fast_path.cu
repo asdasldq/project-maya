@@ -23,6 +23,9 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_helper_link.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/glm_mtp_subset.hpp"
+#include "strata/core/glm_prof.hpp"
+#include "strata/core/glm_p2p.hpp"
 #include "strata/core/glm_dsa_split.hpp"   // glm-dsa B6.3
 #include "strata/core/glm_dsa_spec.hpp"   // glm-dsa B11.2 / B11.3
 #include "strata/core/glm_ngram_draft.hpp"   // glm-dsa B14.13
@@ -1236,12 +1239,17 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (ws_map_.at("output.weight").type < (int) GGML_TYPE_COUNT) mtp_draft_setup(false);
         }
     }
-    // (the draft vocabulary's rows for the speculative decode on a split of 3+ GPUs; a two-GPU split drafts over the
-    // whole head, as up to v1.1.51 - #860)
+    // The draft vocabulary's rows for speculative decode on a split of 3+ GPUs. A two-GPU split drafts
+    // over the whole head, as up to v1.1.51 (#860). The device chain stays off unless MAYA_GLM_MTP_CHAIN=1:
+    // token_embd is uploaded before the expert pool, and only when its type is Q4_K, Q6_K, or Q8_0 and a
+    // few rows match the host dequantizer. Unset keeps the step path, which pushes each draft while the
+    // next one runs.
     if (mtp_il_ >= 0 && F->mtp_dv == 0 && F->mtp_emb_h == nullptr && n_parts_ != 2 &&
         ws_map_.find("output.weight") != ws_map_.end() &&
         ws_map_.at("output.weight").type < (int) GGML_TYPE_COUNT) {
-        mtp_draft_setup(false);
+        const char* ce = std::getenv("MAYA_GLM_MTP_CHAIN");
+        const bool chain_ask = ce != nullptr && std::atoi(ce) != 0;
+        mtp_draft_setup(chain_ask);
     }
     {
         size_t f1 = 0, t1 = 0;
@@ -5136,6 +5144,41 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
     return s;
 }
 
+int Glm5Model::cpu_us_snap(uint64_t* us, int* dev, int cap) const {
+    int n = 0;
+    if (us == nullptr || dev == nullptr || cap <= 0) return 0;
+    for (const Glm5Model* m = this; m != nullptr && n < cap; m = m->split_next_.get()) {
+        const FastState* F = m->fast_;
+        us[n] = F != nullptr ? F->cpu_us.load(std::memory_order_relaxed) : 0;
+        dev[n] = m->dev_;
+        ++n;
+    }
+    return n;
+}
+
+void Glm5Model::log_cpu_prof(const uint64_t* us0, const int* dev0, int n0, double tokens) const {
+    if (us0 == nullptr || dev0 == nullptr || n0 <= 0 || tokens <= 0.0) return;
+    double ms[8];
+    int dev[8];
+    int n = 0;
+    for (const Glm5Model* m = this; m != nullptr && n < 8 && n < n0; m = m->split_next_.get()) {
+        const FastState* F = m->fast_;
+        const uint64_t now = F != nullptr ? F->cpu_us.load(std::memory_order_relaxed) : 0;
+        const uint64_t was = m->dev_ == dev0[n] ? us0[n] : 0;
+        ms[n] = (double) (now - was) / 1000.0;
+        dev[n] = m->dev_;
+        ++n;
+    }
+    const glmprof::CpuRollup r = glmprof::rollup(ms, n);
+    std::fprintf(stderr,
+                 "glm cpu prof: sum %.2f ms (%.2f ms/tok) max-part CUDA%d %.2f ms (%.2f ms/tok). "
+                 "glm stat's cpu lane ms/tok is this sum across parts, not the time a GPU waited\n",
+                 r.sum_ms, r.sum_ms / tokens, r.max_i >= 0 ? dev[r.max_i] : -1, r.max_ms, r.max_ms / tokens);
+    for (int i = 0; i < n; ++i)
+        std::fprintf(stderr, "glm cpu prof: CUDA%d %.2f ms (%.2f ms/tok)\n", dev[i], ms[i], ms[i] / tokens);
+    std::fflush(stderr);
+}
+
 std::vector<Glm5Model::VramReport> Glm5Model::vram_report() const {
     std::vector<VramReport> out;
     int cur = 0;
@@ -7357,12 +7400,12 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         FastState* FB = B->fast_;
         const size_t hop = glmres::res_hop_bytes(g);   // glm-dsa B2.3
         cudaSetDevice(tail->dev_);
-        cudaMemcpyAsync(FA->hop_h, tail->state_, hop, cudaMemcpyDeviceToHost, FA->cs);
-        cudaEventRecord(FA->ev_hop, FA->cs);
+        if (!glmp2p::hop_out(tail->dev_, B->dev_, tail->state_, hop, FA->hop_h, FA->cs, FA->ev_hop, 0, err))
+            return false;
         cudaSetDevice(B->dev_);
         B->pos_ = pos_;
-        cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
-        cudaMemcpyAsync(B->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
+        if (!glmp2p::hop_in(tail->dev_, B->dev_, B->state_, hop, FA->hop_h, FB->cs, FA->cs, FA->ev_hop, 0, err))
+            return false;
         if (!B->fast_layers(p, true, err)) return false;
         tail = B;
     }
@@ -7467,10 +7510,10 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     }();
     const bool sample_draft_on = mtp_sample_ != nullptr && F->spec_q != nullptr && step == 0;
     // (a two-GPU split: only where the caller asks for it, as up to v1.1.51 - its speculative decode drafts over the
-    // whole head, #860.)  3+ GPUs (decode_spec asks nothing): the draft vocabulary while the answer stays in it, the
-    // whole head while it does not - mtp_out_ (decode_spec keeps it) under decode_mtp's 2%.  One GPU: the caller's
-    // choice (decode_mtp's own rule on mtp_out_; mtp_draft asks for the vocabulary)
-    sub = (sub || (!full_head && !sample_draft_on && n_parts_ > 2 && mtp_out_ < 0.02)) && F->mtp_dv > 0;
+    // whole head, #860.)  3+ GPUs (decode_spec and decode_spec_pipe pass caller_sub false): the draft vocabulary
+    // while mtp_out_ stays under 2%, the whole head once the answer leaves it.  One GPU: the caller's choice
+    // (decode_mtp's own rule on mtp_out_; mtp_draft asks for the vocabulary).
+    sub = mtp_draft_subset(sub, full_head, sample_draft_on, n_parts_, mtp_out_, F->mtp_dv);
     mtp_hx_pos_ = -1;   // head_x becomes the block's own hidden state
     if (next_tok < 0) {
         if (F->mtp_emb == nullptr || step < 1) {
@@ -8058,12 +8101,10 @@ bool Glm5Model::hop_to_next(Glm5Model* B, int64_t p, std::string& err) {
     FastState* FA = fast_;
     FastState* FB = B->fast_;
     cudaSetDevice(dev_);
-    cudaMemcpyAsync(FA->hop_h, state_, hop, cudaMemcpyDeviceToHost, FA->cs);
-    cudaEventRecord(FA->ev_hop, FA->cs);
+    if (!glmp2p::hop_out(dev_, B->dev_, state_, hop, FA->hop_h, FA->cs, FA->ev_hop, 0, err)) return false;
     cudaSetDevice(B->dev_);
     B->pos_ = p + 1;
-    cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
-    cudaMemcpyAsync(B->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
+    if (!glmp2p::hop_in(dev_, B->dev_, B->state_, hop, FA->hop_h, FB->cs, FA->cs, FA->ev_hop, 0, err)) return false;
     return B->fast_layers(p, true, err);
 }
 
@@ -8194,9 +8235,13 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     const int sl = (int) (p & 1);
     if (this != hl) {
         // hand off to the next head part through this part's double-buffered hop slot hsl (alternates every spec_head
-        // call, including redos at the same p, so CUDA0's next call never overwrites the slot CUDA1 is still reading)
-        cudaMemcpyAsync(spec_hop_h_[hsl], state_, hop, cudaMemcpyDeviceToHost, F->cs);
-        cudaEventRecord(spec_ev_hop_[hsl], F->cs);
+        // call, including redos at the same p, so the next call never overwrites the slot still being read)
+        if (split_next_ == nullptr) {
+            err = "glm spec: head hop with no next part";
+            return false;
+        }
+        if (!glmp2p::hop_out(dev_, split_next_->dev_, state_, hop, spec_hop_h_[hsl], F->cs, spec_ev_hop_[hsl], hsl, err))
+            return false;
         Glm5Model* prev = this;
         for (Glm5Model* m = split_next_.get(); m != nullptr && m != hl->split_next_.get();
              prev = m, m = m->split_next_.get()) {
@@ -8207,16 +8252,27 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
             if (Fm->prof_on) Fm->collect();
             if (!m->fast_boundary(err)) return false;
             m->pos_ = p + 1;
-            cudaStreamWaitEvent(Fm->cs, prev->spec_ev_hop_[hsl], 0);
-            cudaMemcpyAsync(m->state_, prev->spec_hop_h_[hsl], hop, cudaMemcpyHostToDevice, Fm->cs);
+            if (!glmp2p::hop_in(prev->dev_, m->dev_, m->state_, hop, prev->spec_hop_h_[hsl], Fm->cs, prev->fast_->cs,
+                                prev->spec_ev_hop_[hsl], hsl, err))
+                return false;
             if (!m->fast_layers(p, true, err)) return false;
             const int out_sl = (m == hl) ? sl : hsl;
-            cudaMemcpyAsync(m->spec_hop_h_[out_sl], m->state_, hop, cudaMemcpyDeviceToHost, Fm->cs);
-            cudaEventRecord(m->spec_ev_hop_[out_sl], Fm->cs);
+            if (m->split_next_ == nullptr) {
+                err = "glm spec: head hop with no next part";
+                return false;
+            }
+            if (!glmp2p::hop_out(m->dev_, m->split_next_->dev_, m->state_, hop, m->spec_hop_h_[out_sl], Fm->cs,
+                                 m->spec_ev_hop_[out_sl], out_sl, err))
+                return false;
         }
     } else {
-        cudaMemcpyAsync(hl->spec_hop_h_[sl], hl->state_, hop, cudaMemcpyDeviceToHost, hl->fast_->cs);
-        cudaEventRecord(hl->spec_ev_hop_[sl], hl->fast_->cs);
+        if (hl->split_next_ == nullptr) {
+            err = "glm spec: head hop with no next part";
+            return false;
+        }
+        if (!glmp2p::hop_out(hl->dev_, hl->split_next_->dev_, hl->state_, hop, hl->spec_hop_h_[sl], hl->fast_->cs,
+                             hl->spec_ev_hop_[sl], sl, err))
+            return false;
     }
     lap(3);
     ++spec_n_;
@@ -8264,9 +8320,9 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
     // enqueue this first tail part's (CUDA2's) layers BEFORE syncing the later tail parts (CUDA3): CUDA3 is busy
     // running fast_mtp for ~1.8 ms, and enqueueing CUDA2 first lets CUDA2 run its layers simultaneously with CUDA3's
     // fast_mtp pass
-    cudaStreamWaitEvent(F->cs, head->spec_ev_hop_[sl], 0);
-    if (sprof) cudaEventRecord(spec_ev_[0], F->cs);
-    cudaMemcpyAsync(state_, head->spec_hop_h_[sl], hop, cudaMemcpyHostToDevice, F->cs);
+    if (!glmp2p::hop_in(head->dev_, dev_, state_, hop, head->spec_hop_h_[sl], F->cs, head->fast_->cs,
+                        head->spec_ev_hop_[sl], sl, err, sprof ? spec_ev_[0] : nullptr))
+        return false;
     if (!fast_layers(p, true, err)) return false;
     // (a two-GPU split picks with the argmax here and samples on the host after it, as up to v1.1.51 - decode_spec, #860)
     const bool pick_here = n_parts_ != 2;
@@ -8293,16 +8349,16 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             FastState* FA = m->fast_;
             FastState* FB = next->fast_;
             cudaSetDevice(m->dev_);
-            cudaMemcpyAsync(FA->hop_h, m->state_, hop, cudaMemcpyDeviceToHost, FA->cs);
-            cudaEventRecord(FA->ev_hop, FA->cs);
+            if (!glmp2p::hop_out(m->dev_, next->dev_, m->state_, hop, FA->hop_h, FA->cs, FA->ev_hop, 0, err))
+                return false;
             cudaSetDevice(next->dev_);
             if (!glmfast::cuda_ok(cudaStreamSynchronize(FB->cs), "glm spec tail part sync", err) ||
                 !FB->route_ok(err)) return false;
             if (FB->prof_on) FB->collect();
             if (!next->fast_boundary(err)) return false;
             next->pos_ = p + 1;
-            cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
-            cudaMemcpyAsync(next->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
+            if (!glmp2p::hop_in(m->dev_, next->dev_, next->state_, hop, FA->hop_h, FB->cs, FA->cs, FA->ev_hop, 0, err))
+                return false;
             if (!next->fast_layers(p, true, err)) return false;
         }
         cudaSetDevice(m->dev_);
@@ -8360,15 +8416,21 @@ void Glm5Model::spec_dev_take() {
 }
 
 // hop_to_next in its two halves (the same calls in the same order): this part's residual into its pinned hop_h ...
-void Glm5Model::spec_hop_out(bool prof) {
+bool Glm5Model::spec_hop_out(bool prof, std::string& err) {
     FastState* FA = fast_;
     cudaSetDevice(dev_);
-    cudaMemcpyAsync(FA->hop_h, state_, glmres::res_hop_bytes(g_), cudaMemcpyDeviceToHost, FA->cs);   // glm-dsa B2.3
-    cudaEventRecord(FA->ev_hop, FA->cs);
+    if (split_next_ == nullptr) {
+        err = "glm spec: hop out with no next part";
+        return false;
+    }
+    if (!glmp2p::hop_out(dev_, split_next_->dev_, state_, glmres::res_hop_bytes(g_), FA->hop_h, FA->cs, FA->ev_hop, 0,
+                         err))
+        return false;
     if (prof) {
         cudaEventRecord(spec_ev_[1], FA->cs);
         spec_ev_live_ = true;
     }
+    return true;
 }
 
 // ... and this part (the one after A) waits for it on the device, copies it in and runs its layers at p
@@ -8376,9 +8438,9 @@ bool Glm5Model::spec_hop_in(Glm5Model* A, int64_t p, bool prof, std::string& err
     FastState* FB = fast_;
     cudaSetDevice(dev_);
     pos_ = p + 1;
-    cudaStreamWaitEvent(FB->cs, A->fast_->ev_hop, 0);
-    if (prof) cudaEventRecord(spec_ev_[0], FB->cs);
-    cudaMemcpyAsync(state_, A->fast_->hop_h, glmres::res_hop_bytes(g_), cudaMemcpyHostToDevice, FB->cs);   // glm-dsa B2.3
+    if (!glmp2p::hop_in(A->dev_, dev_, state_, glmres::res_hop_bytes(g_), A->fast_->hop_h, FB->cs, A->fast_->cs,
+                        A->fast_->ev_hop, 0, err, prof ? spec_ev_[0] : nullptr))
+        return false;
     return fast_layers(p, true, err);
 }
 
@@ -8421,17 +8483,16 @@ bool Glm5Model::spec_tail_front(Glm5Model* head, int64_t p, std::string& err) {
         if (sprof) m->spec_dev_take();
     }
     cudaSetDevice(dev_);
-    cudaStreamWaitEvent(F->cs, head->spec_ev_hop_[sl], 0);
-    if (sprof) cudaEventRecord(spec_ev_[0], F->cs);
-    cudaMemcpyAsync(state_, head->spec_hop_h_[sl], glmres::res_hop_bytes(g), cudaMemcpyHostToDevice,
-                    F->cs);   // glm-dsa B2.3
+    if (!glmp2p::hop_in(head->dev_, dev_, state_, glmres::res_hop_bytes(g), head->spec_hop_h_[sl], F->cs,
+                        head->fast_->cs, head->spec_ev_hop_[sl], sl, err, sprof ? spec_ev_[0] : nullptr))
+        return false;
     if (!fast_layers(p, true, err)) return false;
     Glm5Model* m = this;
     for (; m->split_next_.get() != last; m = m->split_next_.get()) {
-        m->spec_hop_out(sprof);
+        if (!m->spec_hop_out(sprof, err)) return false;
         if (!m->split_next_->spec_hop_in(m, p, sprof, err)) return false;
     }
-    m->spec_hop_out(sprof);   // the last part's predecessor: back takes its residual in
+    if (!m->spec_hop_out(sprof, err)) return false;   // the last part's predecessor: back takes its residual in
     cudaSetDevice(dev_);
     return true;
 }

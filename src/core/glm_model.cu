@@ -17,6 +17,7 @@
 // lands), so a batched call is literally the same per-token steps as single-token calls - which
 // is what glm_model_test's batched-vs-streamed equivalence pins.
 #include "glm_fast_state.hpp"
+#include "strata/core/glm_p2p.hpp"
 #include "strata/core/glm_dsa_split.hpp"   // glm-dsa B6.1 / B6.2
 #include "strata/core/glm_dsa_spec.hpp"   // glm-dsa B11.2
 #include "strata/core/glm_pool_classes.hpp"   // glm-dsa B3.7
@@ -1029,8 +1030,7 @@ bool Glm5Model::forward(const std::vector<int32_t>& tokens, std::vector<float>& 
     }
     for (int32_t t : tokens)
         if (!step(t, err)) return false;
-    // the logits live on the LAST half's device (with a split, reading them from device 0 would
-    // need peer access, which is closed on this driver)
+    // the logits live on the LAST half's device (read here with a host copy)
     Glm5Model* tail = this;
     while (tail->split_next_) tail = tail->split_next_.get();
     cudaSetDevice(tail->dev_);
@@ -1376,7 +1376,17 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             return false;
         }
     cudaSetDevice(dev_);
-    std::fprintf(stderr, "glm split: layers %s (one 64 KB host hop per boundary per token)\n", where.c_str());
+    {
+        const size_t hop_bytes = (size_t) g_.hc * (size_t) g_.n_embd * sizeof(float);
+        const char* how = glmp2p::kHostSplitLog;
+        std::string probed;
+        if (glmp2p::env_on()) {
+            probed = glmp2p::prepare_split(devs.data(), (int) devs.size(), hop_bytes);
+            how = probed.c_str();
+        }
+        std::fprintf(stderr, "glm split: layers %s (%s)\n", where.c_str(), how);
+        std::fflush(stderr);
+    }
     return true;
 }
 
@@ -2254,16 +2264,16 @@ bool Glm5Model::step(int32_t token, std::string& err) {
     const Glm5Geometry& g = g_;
     int64_t p = 0;
     if (!step_issue(token, p, err)) return false;
-    // hand the residual across the devices: one 64 KB host hop per boundary (peer access is closed on
-    // this driver, and a single boundary copy per token does not need it)
+    // hand the residual across the devices. MAYA_GLM_P2P=1 peer-copies when the pair was probed;
+    // otherwise, and if that copy fails, the same host vector as before.
     const size_t hop_floats = (size_t) g.hc * (size_t) g.n_embd;
     Glm5Model* prev = this;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
         hop_.resize(hop_floats);
-        cudaSetDevice(prev->dev_);
-        GM_CHECK(cudaMemcpy(hop_.data(), prev->state_, hop_floats * sizeof(float), cudaMemcpyDeviceToHost), err);
+        if (!glmp2p::hop_sync(prev->dev_, m->dev_, m->state_, prev->state_, hop_floats * sizeof(float), hop_.data(),
+                              err))
+            return false;
         cudaSetDevice(m->dev_);
-        GM_CHECK(cudaMemcpy(m->state_, hop_.data(), hop_floats * sizeof(float), cudaMemcpyHostToDevice), err);
         if (!m->step_layers(p, err)) return false;
         prev = m;
     }

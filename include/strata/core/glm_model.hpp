@@ -139,6 +139,9 @@ public:
         double all_gb = 0;   // every routed expert of this model, in GB (the Monitor's SSD-only share is what VRAM and RAM do not hold)
     };
     FastStats fast_stats() const;
+    // MAYA_GLM_PIPE_PROF: per-part CPU-lane microseconds (the stat line adds these, then divides by tokens)
+    int cpu_us_snap(uint64_t* us, int* dev, int cap) const;
+    void log_cpu_prof(const uint64_t* us0, const int* dev0, int n0, double tokens) const;
     /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total
     /// and free memory now, its PCI address (the server finds the GPU NVML numbers by it), the dense weights, the
     /// sequence state (the DSA latent cache, KDA states, indexer keys; kv_ram: KV streaming's pinned copy in RAM), the
@@ -354,9 +357,10 @@ public:
     std::map<std::string, std::string> row_kind_;
 
     // ---- the layer split (speed): this instance owns layers [l0_, l1_) on device dev_.  When
-    // split_next_ is set, step() runs this half, hands the residual over with one 64 KB host hop
-    // (peer access is closed on this driver and not needed for a single boundary copy) and lets the
-    // next half continue through its own layers (and, if it is the last, the head).
+    // split_next_ is set, step() runs this half, then hands the residual to the next part. With
+    // MAYA_GLM_P2P unset that is the host copy. MAYA_GLM_P2P=1 uses a probed device peer copy when
+    // this driver allows it (src/core/glm_p2p.cu) and the host copy if the probe or the copy fails.
+    // The server runs the fast path (fast_token / spec_head / spec_tail), which uses the same rule.
     int l0_ = 0, l1_ = 0;
     int dev_ = 0;
     int n_parts_ = 1;                                      // the devices the layers are split across (the CPU lane's share)
@@ -846,7 +850,7 @@ public:
     // hop_to_next in two halves, and a tail part's MAYA_GLM_SPEC_PROF device span
     bool spec_tail_front(Glm5Model* head, int64_t p, std::string& err);
     bool spec_tail_back(Glm5Model* head, int64_t p, std::string& err);
-    void spec_hop_out(bool prof);
+    bool spec_hop_out(bool prof, std::string& err);
     bool spec_hop_in(Glm5Model* A, int64_t p, bool prof, std::string& err);
     void spec_dev_take();
     // ---- several conversations at once (src/core/glm_multi.cu, MAYA_GLM_SEQS=<n>): each part keeps n sequence
