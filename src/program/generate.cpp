@@ -53,6 +53,7 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/core/mtp_rows.hpp"
 #include "strata/core/split_groups.hpp"
+#include "strata/core/answer_ckpt.hpp"
 #include "strata/core/prefix_cut.hpp"
 #include "strata/core/prefill_pieces.hpp"
 #include "strata/core/prefill_gaps.hpp"
@@ -2525,6 +2526,29 @@ static int glm_pack_generate(const Options& o) {
                     reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
         std::fflush(stdout);
         if (pause_req.load() && std::strcmp(finish, "cancel") == 0) pause_snapshot(prompt, emitted, pause_keep.load());
+        // The prompt snapshot stays where this request put it: before the assistant turn (a 76-token
+        // prompt keeps 75). The decode feeds every written token except the last, so that prefix is a
+        // real state. Keep it as a checkpoint. A later prompt that starts with those ids restores it
+        // and reads only the rest; one that diverges earlier still uses the short snapshot.
+        if (std::strcmp(finish, "cancel") != 0 && ckpt_max > 0 && cur_img_pos.empty() && !model.ablating()) {
+            const size_t keep = strata::core::answer_ckpt_len(prompt.size(), emitted.size(), model.position());
+            if (keep > prompt.size()) {
+                std::vector<int32_t> held;
+                held.reserve(keep);
+                held.insert(held.end(), prompt.begin(), prompt.end());
+                held.insert(held.end(), emitted.begin(), emitted.begin() + (long) (keep - prompt.size()));
+                ckpt_keep(held, keep);
+                bool held_ok = false;
+                for (const auto& c : ckpts)
+                    held_ok = held_ok || (c.tokens.size() == keep &&
+                                          std::equal(c.tokens.begin(), c.tokens.end(), held.begin()));
+                if (held_ok)
+                    std::fprintf(stderr, "glm checkpoints: answer kept at %zu tokens (%zu written, prompt %zu)\n",
+                                 keep, emitted.size(), prompt.size());
+            } else if (emitted.size() > 1)
+                std::fprintf(stderr, "glm checkpoints: answer not kept (position %lld, prompt %zu, written %zu)\n",
+                             (long long) model.position(), prompt.size(), emitted.size());
+        }
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
         if (model.fast()) model.save_usage();
         if (model.fast() && produced > 0) {

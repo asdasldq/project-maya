@@ -58,6 +58,12 @@ The chain queues every draft, then reads the ids back once, then pushes the wind
 
 `MAYA_GLM_MTP_FIXED` unset is the existing length search (`MAYA_GLM_MTP_ADAPT` stays at its default). It does not need this patch. Cap it with `MAYA_GLM_MTP_DRAFT=4`. One traced run shows the length each round; the speed run leaves the trace off. Verification is the same: a draft is kept only when its id matches the trunk pick.
 
+## Conversation reuse
+
+The prompt snapshot is taken before this turn's assistant header. A 76-token prompt therefore reports `cached_tokens` 75 on the next request, including one that sends the generated reply back. That 75 is the original prompt prefix. The generated tokens were not in it. `cached_tokens` is the engine's `reused` count: how many leading ids were restored instead of read again.
+
+A finished answer now also keeps a checkpoint at the tokens the decode fed (every written token except the last). The next prompt reuses that longer prefix when its ids start with it, and still uses the short snapshot when they diverge earlier. The log line is `glm checkpoints: answer kept at N tokens (W written, prompt P)`. A restore logs `glm checkpoints: R of the prompt's T tokens from a checkpoint`. `MAYA_GLM_NO_REUSE` and `MAYA_GLM_CKPTS=0` leave this off. Neither K1 nor the fixed-4 window changes the rule: both feed every written token except the last, and a rejected draft is already rolled back before the checkpoint. Thinking tokens are kept when they were fed. Nothing is stripped from the history.
+
 `MAYA_GLM_PIPE_PROF=1` (off by default; leave it off for a speed run) prints, after the reply:
 
 - `glm cpu prof`: the sum and each part, plus the largest part. Compare the max-part ms/tok with the summed stat line.
