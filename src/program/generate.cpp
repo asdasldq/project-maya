@@ -2160,8 +2160,10 @@ static int glm_pack_generate(const Options& o) {
                 if (gap_reset) gap_reset();   // (a gap's failure: the reset multi_fail left for after the read)
                 return 1;
             }
-            // a call the prompt path did not take (fewer tokens than MAYA_GLM_PREFILL_MIN: false, no error) leaves the
-            // rest to the token path below - from where the prompt path stopped, not from `reuse`
+            // a call the prompt path did not take (fewer tokens than MAYA_GLM_PREFILL_MIN, or a chunk under 256
+            // tokens whose layout does not fit: false, no error) leaves the rest to the token path below - from
+            // where the prompt path stopped, not from `reuse`.  A CUDA error, a lend, or a 256-token layout miss
+            // sets err and ends the request.
             i_first = at;
             if (pok) {
                 i_first = snap_at;

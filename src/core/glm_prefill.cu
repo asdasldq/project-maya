@@ -26,6 +26,7 @@
 #include "strata/core/exl3_mma_rows.hpp"
 #include "strata/core/prefill_chunks.hpp"
 #include "strata/core/prefill_gaps.hpp"
+#include "strata/core/prefill_layout.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
@@ -1754,12 +1755,12 @@ bool Glm5Model::prefill_carve(int Tn, int64_t end) {
     S->dsa_keep = S->has_dsa && g.arch == GlmArch::GlmDsa ? a.take<uint8_t>(glmpf::keep_bytes(g, T, S->max_pools)) : nullptr;   // glm-dsa B9.3
     S->kv_stage = stage > 0 ? a.take<uint8_t>(stage) : nullptr;
     S->uni = S->arena + a.off;
-    blas_ck(cublasSetWorkspace(S->blas, S->ws, S->ws_bytes), "set workspace");
     S->T_bound = Tn;
     S->need = c.off;
     // A test hook: MAYA_PREALLOC_FAIL=<tokens> makes the layout of a request's chunk bigger than that fail (the
     // startup's layout is not touched), so the recovery (the prompt is read again with a smaller chunk) can be
-    // checked.
+    // checked.  A miss returns before the cuBLAS workspace is replaced: the handle keeps the workspace of the
+    // last layout that fit (the warm-up, or the previous prompt).
     static const int64_t fail_above = [] {
         const char* v = std::getenv("MAYA_PREALLOC_FAIL");
         return v ? std::atoll(v) : 0;
@@ -1774,6 +1775,7 @@ bool Glm5Model::prefill_carve(int Tn, int64_t end) {
                      S->region_bytes);
         return false;
     }
+    blas_ck(cublasSetWorkspace(S->blas, S->ws, S->ws_bytes), "set workspace");
     return true;
 }
 
@@ -4935,10 +4937,10 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
                           : strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr,
                                                             prefill_floor(nn, prefill_min_chunks));
     bool ok = true;
-    progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
     // The layout of the chunk: it must fit the lendable region.  A chunk whose layout does not fit is read again
-    // with a smaller one (nothing has been computed yet, so this is safe) - and a chunk that does not fit at 256
-    // tokens is the end of the prompt path's memory: the request ends with an error, the engine lives.
+    // with a smaller one (nothing has been lent or computed yet).  A chunk already under 256 tokens has no
+    // smaller batched layout, so those tokens go through the token path.  A chunk that does not fit at 256
+    // tokens is still the end of the prompt path's memory: the request ends with an error, the engine lives.
     int Trun = Trun_max;
     for (;;) {
         bool laid_out = true;
@@ -4946,8 +4948,17 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
             cudaSetDevice(m->dev_);
             if (!m->prefill_carve(Trun, pos_ + nn)) laid_out = false;
         }
-        if (laid_out) break;
-        if (Trun <= kMinPrefillChunk) {
+        const strata::core::PrefillLayoutStep step =
+            strata::core::prefill_layout_step(laid_out, Trun, kMinPrefillChunk);
+        if (step == strata::core::PrefillLayoutStep::Run) break;
+        if (step == strata::core::PrefillLayoutStep::TokenPath) {
+            std::fprintf(stderr, "glm prefill: CUDA%d a chunk of %d tokens does not fit the lendable region; "
+                                 "%lld tokens go through the token path\n",
+                         dev_, Trun, (long long) nn);
+            cudaSetDevice(dev_);
+            return false;
+        }
+        if (step == strata::core::PrefillLayoutStep::Error) {
             err = "glm prefill: the layout of a chunk of " + std::to_string(Trun) +
                   " tokens does not fit the lendable region";
             ok = false;
@@ -4957,6 +4968,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         std::fprintf(stderr, "glm prefill: CUDA%d the chunk is %d tokens now (its layout did not fit)\n", dev_, Trun);
     }
     if (ok) {
+        progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
             cudaSetDevice(m->dev_);
             if (!m->prefill_lend(err)) { ok = false; break; }
