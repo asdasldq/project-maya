@@ -23,6 +23,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_helper_link.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/glm_prof.hpp"
 #include "strata/core/glm_p2p.hpp"
 #include "strata/core/glm_dsa_split.hpp"   // glm-dsa B6.3
 #include "strata/core/glm_dsa_spec.hpp"   // glm-dsa B11.2 / B11.3
@@ -5135,6 +5136,41 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
         s.ms = fast_->ms;
     }
     return s;
+}
+
+int Glm5Model::cpu_us_snap(uint64_t* us, int* dev, int cap) const {
+    int n = 0;
+    if (us == nullptr || dev == nullptr || cap <= 0) return 0;
+    for (const Glm5Model* m = this; m != nullptr && n < cap; m = m->split_next_.get()) {
+        const FastState* F = m->fast_;
+        us[n] = F != nullptr ? F->cpu_us.load(std::memory_order_relaxed) : 0;
+        dev[n] = m->dev_;
+        ++n;
+    }
+    return n;
+}
+
+void Glm5Model::log_cpu_prof(const uint64_t* us0, const int* dev0, int n0, double tokens) const {
+    if (us0 == nullptr || dev0 == nullptr || n0 <= 0 || tokens <= 0.0) return;
+    double ms[8];
+    int dev[8];
+    int n = 0;
+    for (const Glm5Model* m = this; m != nullptr && n < 8 && n < n0; m = m->split_next_.get()) {
+        const FastState* F = m->fast_;
+        const uint64_t now = F != nullptr ? F->cpu_us.load(std::memory_order_relaxed) : 0;
+        const uint64_t was = m->dev_ == dev0[n] ? us0[n] : 0;
+        ms[n] = (double) (now - was) / 1000.0;
+        dev[n] = m->dev_;
+        ++n;
+    }
+    const glmprof::CpuRollup r = glmprof::rollup(ms, n);
+    std::fprintf(stderr,
+                 "glm cpu prof: sum %.2f ms (%.2f ms/tok) max-part CUDA%d %.2f ms (%.2f ms/tok). "
+                 "glm stat's cpu lane ms/tok is this sum across parts, not the time a GPU waited\n",
+                 r.sum_ms, r.sum_ms / tokens, r.max_i >= 0 ? dev[r.max_i] : -1, r.max_ms, r.max_ms / tokens);
+    for (int i = 0; i < n; ++i)
+        std::fprintf(stderr, "glm cpu prof: CUDA%d %.2f ms (%.2f ms/tok)\n", dev[i], ms[i], ms[i] / tokens);
+    std::fflush(stderr);
 }
 
 std::vector<Glm5Model::VramReport> Glm5Model::vram_report() const {

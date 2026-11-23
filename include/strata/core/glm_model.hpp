@@ -139,6 +139,9 @@ public:
         double all_gb = 0;   // every routed expert of this model, in GB (the Monitor's SSD-only share is what VRAM and RAM do not hold)
     };
     FastStats fast_stats() const;
+    // MAYA_GLM_PIPE_PROF: per-part CPU-lane microseconds (the stat line adds these, then divides by tokens)
+    int cpu_us_snap(uint64_t* us, int* dev, int cap) const;
+    void log_cpu_prof(const uint64_t* us0, const int* dev0, int n0, double tokens) const;
     /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total
     /// and free memory now, its PCI address (the server finds the GPU NVML numbers by it), the dense weights, the
     /// sequence state (the DSA latent cache, KDA states, indexer keys; kv_ram: KV streaming's pinned copy in RAM), the

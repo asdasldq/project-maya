@@ -2320,6 +2320,11 @@ static int glm_pack_generate(const Options& o) {
         if (stop_req.load()) finish = "cancel";
         const auto t1 = std::chrono::steady_clock::now();
         const auto st1 = model.fast_stats();
+        uint64_t cpu_us0[8] = {};
+        int cpu_dev0[8] = {};
+        int cpu_n0 = 0;
+        if (const char* pp = std::getenv("MAYA_GLM_PIPE_PROF"); pp != nullptr && std::atoi(pp) != 0)
+            cpu_n0 = model.cpu_us_snap(cpu_us0, cpu_dev0, 8);
         const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;   // (the drafts this request so far: STAT, DONE)
         int64_t produced = 0;
         // one emitted token: the T line, the live tier counters every 8 tokens, the stop conditions (false: stop)
@@ -2536,6 +2541,7 @@ static int glm_pack_generate(const Options& o) {
                          (double) (st2.cpu_experts - st1.cpu_experts) / n, (st2.cpu_ms - st1.cpu_ms) / n,
                          prompt_ms / (double) std::max<size_t>(1, prompt.size()), (long long) st2.pool_used,
                          (long long) st2.pool_slots, (long long) st2.ram_used, (long long) st2.ram_slots);
+            if (cpu_n0 > 0) model.log_cpu_prof(cpu_us0, cpu_dev0, cpu_n0, n);
             if (const std::string p2p = strata::core::glmp2p::stat_line(); !p2p.empty()) {
                 std::fprintf(stderr, "%s\n", p2p.c_str());
                 std::fflush(stderr);

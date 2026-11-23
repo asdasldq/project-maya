@@ -885,6 +885,12 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
     bool begun = false;
     bool ok = true;
     int64_t rounds = 0, drafted = 0, accepted = 0;
+    static const bool pipe_prof = [] {
+        const char* e = getenv("MAYA_GLM_PIPE_PROF");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    double prof_draft = 0, prof_pick = 0, prof_commit = 0, prof_cache = 0, prof_round = 0;
+    int64_t prof_rows = 0, prof_kept = 0, prof_chain = 0, prof_step = 0;
     // MAYA_GLM_WIN_COMMIT_WAIT=1: the parts' commits waited for (A/B; off: the next window queues behind them)
     static const bool commit_wait = [] {
         const char* v = getenv("MAYA_GLM_WIN_COMMIT_WAIT");
@@ -915,6 +921,10 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
             if (TL->mtp_hx_pos_ != N - 1) n = 0;   // (head_x has no trunk state for the first draft step: a plain token)
             n = std::max(n, 0);
             const bool chain = FT->mtp_emb != nullptr && mtp_chain_wanted();
+            if (pipe_prof) {
+                if (chain) ++prof_chain;
+                else ++prof_step;
+            }
             if (n > 0) {
                 cudaSetDevice(TL->dev_);
                 if (chain) {
@@ -963,6 +973,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
         }
         if (!batched_win && !win_pipe_push(-1, err)) { ok = false; break; }
         if (trace) std::fprintf(stderr, "glm spec pipe: p0 %lld drafts %d\n", (long long) N, nd);
+        const auto t_after_draft = pipe_prof ? std::chrono::steady_clock::now() : t_round;
         // ---- the window's tokens: the anchor y (t = 0, already begun) and the drafts
         const int T = 1 + nd;
         int acc = 0;
@@ -1001,6 +1012,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
             if (!ok) break;
             if (!win_pipe_settle(err)) { ok = false; break; }
         }
+        const auto t_after_pick = pipe_prof ? std::chrono::steady_clock::now() : t_round;
         drafted += nd;
         accepted += acc;
         spec_steps_ += (uint64_t) nd;
@@ -1028,8 +1040,10 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
         const int32_t y2 = forced(out[(size_t) keep - 1]);
         // ---- the commit: the kept rows' recurrent states restored/replayed per part; wait for the crew threads to
         // finish enqueueing their commit work before touching the block part's stream below
+        const auto t_before_commit = pipe_prof ? std::chrono::steady_clock::now() : t_round;
         if (!window_commit(keep, err, commit_wait || !more)) { ok = false; break; }
         win_commit_wait();
+        const auto t_after_commit = pipe_prof ? std::chrono::steady_clock::now() : t_round;
         // ---- the NextN cache: entries p0..p0 + keep - 2 from the kept rows' trunk states and the accepted drafts
         // (a kept row's cache entries replace what the wrong drafts wrote at the same positions), and head_x again
         // holds the FIRST DRAFT STEP's trunk hidden state for the next round's drafts.  MAYA_GLM_SPEC_PIPE_DRAIN=1
@@ -1052,6 +1066,19 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
         TL->mtp_hx_pos_ = N + keep - 1;
         if (g.arch == GlmArch::GlmDsa) TL->mtp_carry_note(TL->mtp_hx_pos_, FT->head_x, FT->cs);   // (glm-dsa L1-4)
         if (trace) std::fprintf(stderr, "glm spec pipe2: p0 %lld keep %d acc %d (%d rows)\n", (long long) N, keep, acc, T);
+        if (pipe_prof) {
+            const auto t_after_cache = std::chrono::steady_clock::now();
+            const auto gap = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            prof_draft += gap(t_round, t_after_draft);
+            prof_pick += gap(t_after_draft, t_after_pick);
+            prof_commit += gap(t_before_commit, t_after_commit);
+            prof_cache += gap(t_after_commit, t_after_cache);
+            prof_round += gap(t_round, t_after_cache);
+            prof_rows += T;
+            prof_kept += keep;
+        }
         // the adaptive length's bookkeeping (decode_mtp's; the round's wall time is the length's next measurement)
         {
             const double ms = ms_since(t_round);
@@ -1101,6 +1128,17 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
     if (rounds > 0 && trace)
         std::fprintf(stderr, "glm spec pipe: %lld rounds, %.2f drafts, %.2f accepted a round\n",
                      (long long) rounds, (double) drafted / (double) rounds, (double) accepted / (double) rounds);
+    if (pipe_prof && rounds > 0) {
+        const double nr = (double) rounds;
+        std::fprintf(stderr,
+                     "glm pipe prof: %lld rounds, %lld rows queued, %lld kept | host ms/round draft %.2f pick %.2f "
+                     "commit %.2f cache %.2f round %.2f | chain rounds %lld step rounds %lld\n"
+                     "glm pipe prof: host phase times are this thread's. They are not overlapped GPU time, and they "
+                     "are not glm stat's cpu lane ms/tok (that sum adds every part).\n",
+                     (long long) rounds, (long long) prof_rows, (long long) prof_kept, prof_draft / nr, prof_pick / nr,
+                     prof_commit / nr, prof_cache / nr, prof_round / nr, (long long) prof_chain, (long long) prof_step);
+        std::fflush(stderr);
+    }
     win_prof_report();
     if (ok && gf::launch_errors() > 0) {
         err = "glm spec pipe: a kernel launch failed (see stderr)";

@@ -35,7 +35,18 @@ On the rev2 log this arithmetic is 223 queued, 200 consumed, gap 23. That is 22 
 
 Next distinction, only after this accounting build prints `consumed_checked=1` and `mismatch=0`: stop the server, then run the same temp-0 prompt twice with `MAYA_GLM_CPU_LANE=0`, once with `MAYA_GLM_P2P=0` and once with `MAYA_GLM_P2P=1` (check on). That turns the CPU expert lane off so timing cannot move experts between CPU and GPU. If the texts still differ, the divergence is not that lane. If they match, the earlier difference followed the lane's timing. Do not treat either result as a speed measurement.
 
-Do not start this through `maya.py` or `maya.sh`. Those rebuild `build/maya` from the tree and can replace the restored engine. Stop the running server first so two processes do not map the same weights. Point the existing `server.py` wrapper at `build-p2p-rev3/maya` only, and check that binary's sha256 before the request. Leave the restored official binary in place.
+Do not start this through `maya.py` or `maya.sh`. Those rebuild `build/maya` from the tree and can replace the restored engine. Stop the running server first so two processes do not map the same weights. Point the existing `server.py` wrapper at the new binary only, and check that file's sha256 before the request. Leave the restored official binary in place.
+
+## Window drafts versus one-draft decode
+
+`MAYA_GLM_SPEC_WIN=1` with `MAYA_GLM_MTP_FIXED=4` or `2` was not faster than `decode_spec` on the short prompts. K=2 cut the hops and left the reported CPU-lane ms/tok essentially unchanged, so that counter is not evidence that CPU experts are the wall-clock limit. `glm stat`'s cpu lane ms/tok adds every GPU part's own CPU compute and divides by output tokens. Parts overlap, so the sum is not the time a GPU waited. A window hop logged at slot 16 is the second pipeline bank's first token (`kPipeMax` is 16), one 64 KiB residual, not sixteen copies.
+
+`MAYA_GLM_PIPE_PROF=1` (off by default; leave it off for a speed run) prints, after the reply:
+
+- `glm cpu prof`: the sum and each part, plus the largest part. Compare the max-part ms/tok with the summed stat line.
+- On the window path only, `glm pipe prof`: this thread's ms/round in draft, pick, commit, and cache, plus rows queued and kept, and whether the draft chain waited once (`chain rounds`) or once per draft (`step rounds`).
+
+Use one warmed request of about 128–256 tokens after a throwaway of the same prompt, temp 0, thinking off, for `decode_spec` and for the window. Do not compare a cold start with a warm one. No speed claim follows from this instrumentation alone.
 
 Leave the running service on the previous binary until this one is started beside it. Roll back by exiting the process; `MAYA_GLM_P2P` unset or `0` does not enable peer access and does not run the check.
 
