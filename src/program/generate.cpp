@@ -1807,12 +1807,17 @@ static int glm_pack_generate(const Options& o) {
     // prompt[0, p) for a p the read went past - glm-dsa's positional state, Glm5Model::ckpt_save_at; glm-dsa has no
     // snapshot buffers to copy either, so a from_snapshot checkpoint there is the position p too)
     const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p, bool from_snapshot = false,
-                               bool at_pos = false) {
+                               bool at_pos = false, int protect = -1) {
         if ((int) ckpts.size() < ckpt_max) ckpts.emplace_back();
-        size_t c = 0;
+        size_t c = ckpts.size();
         for (size_t i = 0; i < ckpts.size(); ++i) {
+            if ((int) i == protect) continue;
             if (ckpts[i].tokens.empty()) { c = i; break; }
-            if (ckpts[i].used < ckpts[c].used) c = i;
+            if (c == ckpts.size() || ckpts[i].used < ckpts[c].used) c = i;
+        }
+        if (c == ckpts.size()) {
+            std::fprintf(stderr, "glm checkpoints: not kept at %zu (no free slot)\n", p);
+            return;
         }
         std::string e;
         ckpts[c].tokens.clear();
@@ -1826,6 +1831,30 @@ static int glm_pack_generate(const Options& o) {
         }
         ckpts[c].tokens.assign(prompt.begin(), prompt.begin() + (long) p);
         ckpts[c].used = ++ckpt_clock;
+    };
+    // The live snapshot is a real per-part KDA copy (snap_), named by snap_tokens. Copy that state into a
+    // checkpoint before something else replaces it. protect is a slot that must not be the victim (the checkpoint
+    // about to be restored). A metadata-only entry is not written: ckpt_save_snapshot copies snap_.
+    const auto keep_earlier_snapshot = [&](const std::vector<int32_t>& base, size_t before, int protect) {
+        if (ckpt_max <= 0 || !cur_img_pos.empty() || snap_tokens.empty()) return;
+        if (snap_tokens.size() >= before || snap_tokens.size() >= 512 || snap_tokens.size() > base.size()) return;
+        if (!std::equal(snap_tokens.begin(), snap_tokens.end(), base.begin())) return;
+        for (const auto& c : ckpts)
+            if (c.tokens.size() == snap_tokens.size() &&
+                std::equal(c.tokens.begin(), c.tokens.end(), snap_tokens.begin()))
+                return;
+        const size_t earlier = snap_tokens.size();
+        const auto t_copy = std::chrono::steady_clock::now();
+        ckpt_keep(base, earlier, true, false, protect);
+        model.ckpt_join();
+        bool held = false;
+        for (const auto& c : ckpts)
+            held = held || (c.tokens.size() == earlier &&
+                            std::equal(c.tokens.begin(), c.tokens.end(), base.begin()));
+        if (!held) return;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_copy).count();
+        std::fprintf(stderr, "glm checkpoints: kept the earlier snapshot at %zu before %zu (%.0f ms)\n", earlier,
+                     before, ms);
     };
     // A route that found a non-finite score (or an expert id out of range) means a NaN or an infinity in the state the
     // request ran on: its conversation must not be served again.  The kept snapshot and every slot this prompt
@@ -1912,16 +1941,24 @@ static int glm_pack_generate(const Options& o) {
                 if (reuse > 0) ckpt_drop_past(0);   // another conversation's state now
             }
             if (reuse > 0) {
-            } else if (model.ckpt_restore(ckpt_base + ck, ce)) {
-                reuse = ck_len;
-                from_ckpt = true;
-                ckpts[(size_t) ck].used = ++ckpt_clock;
-                snap_tokens.clear();   // the snapshot's position lies past the checkpoint: overwritten from here on
-                std::fprintf(stderr, "glm checkpoints: %zu of the prompt's %zu tokens from a checkpoint\n", reuse,
-                             prompt.size());
             } else {
-                std::fprintf(stderr, "glm checkpoints: %s\n", ce.c_str());
-                ckpts[(size_t) ck].tokens.clear();
+                const auto t_restore = std::chrono::steady_clock::now();
+                if (model.ckpt_restore(ckpt_base + ck, ce)) {
+                    reuse = ck_len;
+                    from_ckpt = true;
+                    ckpts[(size_t) ck].used = ++ckpt_clock;
+                    // A shorter device snapshot (the 75-token prompt prefix) is still in snap_. clear() drops its
+                    // name, and the later overwrite never sees it, so an edited turn then matches nothing. Copy the
+                    // state first. The slot just restored is protected.
+                    keep_earlier_snapshot(prompt, ck_len, ck);
+                    snap_tokens.clear();
+                    std::fprintf(stderr, "glm checkpoints: %zu of the prompt's %zu tokens from a checkpoint (%.0f ms)\n",
+                                 reuse, prompt.size(),
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_restore).count());
+                } else {
+                    std::fprintf(stderr, "glm checkpoints: %s\n", ce.c_str());
+                    ckpts[(size_t) ck].tokens.clear();
+                }
             }
         }
         // glm-dsa B14.14: the conversation in the model goes to the NVMe prompt cache before this prompt overwrites it
@@ -2194,25 +2231,7 @@ static int glm_pack_generate(const Options& o) {
                 // same ids (the previous turn's 75) would otherwise exist only until this overwrite, and the next
                 // request that still starts there — but not with this whole prompt — would read from token 0.
                 // Keep that prefix as a checkpoint first. The bytes copied are the snapshot's, not the live state.
-                if (ckpt_max > 0 && cur_img_pos.empty() && !snap_tokens.empty() && snap_tokens.size() < snap_at &&
-                    snap_tokens.size() < 512 &&
-                    std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin())) {
-                    bool have = false;
-                    for (const auto& c : ckpts)
-                        have = have || (c.tokens.size() == snap_tokens.size() &&
-                                        std::equal(c.tokens.begin(), c.tokens.end(), snap_tokens.begin()));
-                    if (!have) {
-                        const size_t earlier = snap_tokens.size();
-                        ckpt_keep(prompt, earlier, true);
-                        bool held = false;
-                        for (const auto& c : ckpts)
-                            held = held || (c.tokens.size() == earlier &&
-                                            std::equal(c.tokens.begin(), c.tokens.end(), prompt.begin()));
-                        if (held)
-                            std::fprintf(stderr, "glm checkpoints: kept the earlier snapshot at %zu before %zu\n",
-                                         earlier, snap_at);
-                    }
-                }
+                keep_earlier_snapshot(prompt, snap_at, -1);
                 if (model.snapshot_save()) {
                     snap_tokens.assign(prompt.begin(), prompt.begin() + (long) snap_at);
                     snap_img_hash = img_hash(snap_tokens.size());
@@ -2565,9 +2584,13 @@ static int glm_pack_generate(const Options& o) {
                 for (const auto& c : ckpts)
                     held_ok = held_ok || (c.tokens.size() == keep &&
                                           std::equal(c.tokens.begin(), c.tokens.end(), held.begin()));
-                if (held_ok)
+                if (held_ok) {
                     std::fprintf(stderr, "glm checkpoints: answer kept at %zu tokens (%zu written, prompt %zu)\n",
                                  keep, emitted.size(), prompt.size());
+                    // The device snapshot is still the prompt prefix. The next exact history restores the answer
+                    // checkpoint and would otherwise forget this prefix. Copy it now, after DONE.
+                    keep_earlier_snapshot(held, keep, -1);
+                }
             } else if (emitted.size() > 1)
                 std::fprintf(stderr, "glm checkpoints: answer not kept (position %lld, prompt %zu, written %zu)\n",
                              (long long) model.position(), prompt.size(), emitted.size());

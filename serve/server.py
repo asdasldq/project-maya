@@ -4471,6 +4471,9 @@ class Service:
             kept = [w for w in prev if not (len(w) == 3 and w[2] == seq)]
             self._written = [(key, len(ids), seq)] + kept[:3]
         print(f"[maya] history ids: kept prompt {len(ids)} + {len(produced)} engine ids ({kind})", flush=True)
+        if os.environ.get("MAYA_HISTORY_IDS") == "1":
+            shown = ",".join(str(t) for t in list(produced)[:512])
+            print(f"[maya] history ids: emitted {shown}", flush=True)
 
     def _as_written(self, new: list[int]) -> list[int]:
         """THE HISTORY IN THE MODEL'S OWN TOKENS.  A model does not always write the ids its tokenizer would give its
@@ -4506,6 +4509,9 @@ class Service:
             while k < m and new[k] == seq[k]:
                 k += 1
             if k == len(seq):
+                if k > plen:
+                    print(f"[maya] history ids: render already matches {k - plen} engine ids at offset {plen} "
+                          f"(no splice)", flush=True)
                 return new                    # (it goes on from all of it already)
             if k < plen:
                 continue                      # (it left that conversation before the answer: not this one)

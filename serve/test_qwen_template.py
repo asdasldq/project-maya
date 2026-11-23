@@ -173,6 +173,64 @@ class ServerClose(unittest.TestCase):
         glm._written.append((svc._written[0][0], 0, [9, 9, 9]))
         self.assertEqual(glm._as_written(g_canon), g_next)
 
+    def test_glm_splice_uses_a_real_bpe_split(self):
+        """A merge the tokenizer would apply, stored as its two pieces instead: same bytes, more ids.
+        That is the 256-vs-257 case. A changed byte, or a special token only on one side, is not spliced."""
+        svc, tok = self.svc("glm5")
+        text_of = {s: i for i, s in enumerate(tok.tokens)}
+        split = None
+        for i, s in enumerate(tok.tokens):
+            piece = tok.decode([i])
+            if not piece or piece != piece.strip():
+                continue
+            for cut in range(1, len(s)):
+                a, b = text_of.get(s[:cut]), text_of.get(s[cut:])
+                if a is None or b is None or a == i or b == i:
+                    continue
+                if not tok.decode([a]).strip() and not tok.decode([b]).strip():
+                    continue
+                split = (i, a, b)
+                break
+            if split:
+                break
+        self.assertIsNotNone(split)
+        merged, a, b = split
+        word = tok.decode([merged])
+        self.assertEqual(b"".join(tok.token_bytes(t) for t in (a, b)), tok.token_bytes(merged))
+        self.assertNotEqual([a, b], [merged])
+        u1 = {"role": "user", "content": "Say this."}
+        u2 = {"role": "user", "content": "Again?"}
+        off = {"enable_thinking": False}
+
+        def render(messages):
+            m, t, kw = openai_to_messages({"messages": messages})
+            return svc.render_ids(m, t, {**kw, **off})
+
+        ids = render([u1])
+        normal = tok.encode(word)
+        self.assertIn(merged, normal)
+        own = []
+        for t in normal:
+            own.extend([a, b] if t == merged else [t])
+        self.assertGreater(len(own), len(normal))
+        self.assertEqual(b"".join(tok.token_bytes(t) for t in own), b"".join(tok.token_bytes(t) for t in normal))
+        svc._note_written(ids, own, None)
+        canon = render([u1, {"role": "assistant", "content": word}, u2])
+        self.assertEqual(canon[:len(ids)], ids)
+        nxt = svc._as_written(canon)
+        self.assertEqual(nxt[:len(ids) + len(own)], ids + own)
+        self.assertEqual(tok.decode(nxt), tok.decode(canon))
+        edited = render([u1, {"role": "assistant", "content": word + " no"}, u2])
+        # The original bytes are a prefix of the longer text, so the splice may keep them and leave " no".
+        # A change inside the word is not a prefix.
+        inner = word[:1] + "Q" + word[1:]
+        changed = render([u1, {"role": "assistant", "content": inner}, u2])
+        self.assertEqual(svc._as_written(changed), changed)
+        special = next(i for i, ty in enumerate(tok.token_types) if ty == 3)
+        svc._written.clear()
+        svc._note_written(ids, own + [special], None)
+        self.assertEqual(svc._as_written(canon), canon)
+
     def test_other_templates_and_prompts_keep_the_bare_close(self):
         svc, tok = self.svc("qwen")
         think_end = tok.encode("</think>", parse_special=True)[0]
