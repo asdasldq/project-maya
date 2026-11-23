@@ -2190,6 +2190,29 @@ static int glm_pack_generate(const Options& o) {
             strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
             strata::core::progress_beat();
             if (model.fast() && !snapped && i == snap_at) {
+                // The live snapshot is about to move to this prompt's assistant header. A shorter prefix of the
+                // same ids (the previous turn's 75) would otherwise exist only until this overwrite, and the next
+                // request that still starts there — but not with this whole prompt — would read from token 0.
+                // Keep that prefix as a checkpoint first. The bytes copied are the snapshot's, not the live state.
+                if (ckpt_max > 0 && cur_img_pos.empty() && !snap_tokens.empty() && snap_tokens.size() < snap_at &&
+                    snap_tokens.size() < 512 &&
+                    std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin())) {
+                    bool have = false;
+                    for (const auto& c : ckpts)
+                        have = have || (c.tokens.size() == snap_tokens.size() &&
+                                        std::equal(c.tokens.begin(), c.tokens.end(), snap_tokens.begin()));
+                    if (!have) {
+                        const size_t earlier = snap_tokens.size();
+                        ckpt_keep(prompt, earlier, true);
+                        bool held = false;
+                        for (const auto& c : ckpts)
+                            held = held || (c.tokens.size() == earlier &&
+                                            std::equal(c.tokens.begin(), c.tokens.end(), prompt.begin()));
+                        if (held)
+                            std::fprintf(stderr, "glm checkpoints: kept the earlier snapshot at %zu before %zu\n",
+                                         earlier, snap_at);
+                    }
+                }
                 if (model.snapshot_save()) {
                     snap_tokens.assign(prompt.begin(), prompt.begin() + (long) snap_at);
                     snap_img_hash = img_hash(snap_tokens.size());

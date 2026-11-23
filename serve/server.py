@@ -2871,6 +2871,7 @@ class Service:
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        self._written_lock = threading.Lock()   # the remembered answer ids (_note_written / _as_written)
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.config_path = None                          # the run config (a context change is saved into it)
         self.savings = None                              # serve/savings.py's Ledger: what the API would have charged
@@ -4055,7 +4056,7 @@ class Service:
                 given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep + (loop_guard.said_before(asked),)}
         if getattr(self.template, "hy4", False) and getattr(self, "vision", None) is None:
             messages = hy4_tool_pictures_noted(messages)   # (a tool result's picture: a text note, not a 400)
-        ids = self._as_written(self.render_ids(messages, tools, kwargs, prefill))   # (Qwen3.x: the model's own ids)
+        ids = self._as_written(self.render_ids(messages, tools, kwargs, prefill))   # (Qwen3.x and GLM: the model's own ids)
         self.embeddings.path = None
         media = media_of(messages)
         if media and self.text_only() and getattr(self.template, "glm_dsa", False) and \
@@ -4436,31 +4437,70 @@ class Service:
             sp = self._special_id_set = {i for i, t in enumerate(types) if t in (3, 4)}
         return sp
 
+    def _history_model_key(self):
+        """Which model these remembered ids belong to. A different template or model name does not reuse them."""
+        t = self.template
+        return (bool(getattr(t, "qwen", False)), bool(getattr(t, "glm_effort", False)),
+                bool(getattr(t, "glm_dsa", False)), getattr(self, "model", ""))
+
+    def _history_ids_model(self) -> str | None:
+        """Qwen3.x keeps an answer that ended on a stop token. GLM (Flash and GLM-5.3) also keeps one that ended on
+        the length cap: the chat template re-encodes the assistant text, and that segmentation is not the ids the
+        engine wrote. None for every other template."""
+        if getattr(self.template, "qwen", False):
+            return "qwen"
+        if getattr(self.template, "glm_effort", False) or getattr(self.template, "glm_dsa", False):
+            return "glm"
+        return None
+
     def _note_written(self, ids, produced, emb) -> None:
-        """A finished answer's tokens as the engine read and wrote them (prompt + answer up to its end-of-turn token),
-        for _as_written: Qwen3.x templates, text prompts, answers that ended at a stop token.  The last 4 kept."""
-        if not getattr(self.template, "qwen", False) or emb or not produced or produced[-1] not in self.stop_ids or \
-                not hasattr(self.tok, "token_bytes"):
+        """A finished answer's tokens as the engine read and wrote them (prompt + those ids), for _as_written.
+        Qwen3.x: an answer that ended at a stop token. GLM: a length finish too. Text prompts only. The last 4
+        kept, each tagged with this model. An edit of the prompt or the answer fails the byte check later."""
+        kind = self._history_ids_model()
+        if kind is None or emb or not produced or not hasattr(self.tok, "token_bytes"):
+            return
+        if kind == "qwen" and produced[-1] not in self.stop_ids:
             return
         seq = list(ids) + list(produced)
-        kept = [w for w in (getattr(self, "_written", None) or []) if w[1] != seq]
-        self._written = [(len(ids), seq)] + kept[:3]
+        key = self._history_model_key()
+        with self._written_lock:
+            prev = list(getattr(self, "_written", None) or [])
+            if any(len(w) == 3 and w[2] == seq for w in prev):
+                return
+            kept = [w for w in prev if not (len(w) == 3 and w[2] == seq)]
+            self._written = [(key, len(ids), seq)] + kept[:3]
+        print(f"[maya] history ids: kept prompt {len(ids)} + {len(produced)} engine ids ({kind})", flush=True)
 
     def _as_written(self, new: list[int]) -> list[int]:
         """THE HISTORY IN THE MODEL'S OWN TOKENS.  A model does not always write the ids its tokenizer would give its
         text (`\\n -(` written as `\\n `+`-(`, ...), so the next request's history - the same text, tokenized again -
         left the session at the first such spot and the engine read the rest of the answer again (an ISO-8601 parser's
         thinking: 2,055 of 2,134 tokens).  Where the new prompt holds a remembered answer's text byte for byte (and
-        the same special tokens), the engine's ids go in its place - the text the model reads is unchanged.  Qwen3.x
-        templates only (_note_written).  Anything unexpected: the prompt as rendered (never a failed request)."""
+        the same special tokens) after that answer's own prompt, the engine's ids go in its place - the text the
+        model reads is unchanged.  Qwen3.x and GLM (_note_written).  A different model, an edited turn, or unequal
+        bytes stay as rendered.  Anything unexpected: the prompt as rendered (never a failed request)."""
         try:
             return self._as_written_ids(new)
         except Exception as e:  # noqa: BLE001
             print(f"[maya] the history's own ids were not used ({type(e).__name__}: {e})", flush=True)
             return new
 
+    def _history_piece(self, t: int) -> bytes:
+        try:
+            return self.tok.token_bytes(t)[:24]
+        except Exception:  # noqa: BLE001
+            return b"?"
+
     def _as_written_ids(self, new: list[int]) -> list[int]:
-        for plen, seq in getattr(self, "_written", None) or []:
+        key = self._history_model_key()
+        with self._written_lock:
+            remembered = list(getattr(self, "_written", None) or [])
+        told = False
+        for item in remembered:
+            if len(item) != 3 or item[0] != key:
+                continue
+            _key, plen, seq = item
             m = min(len(new), len(seq))
             k = 0
             while k < m and new[k] == seq[k]:
@@ -4475,11 +4515,21 @@ class Service:
             while j < len(new) and got < len(want):
                 got += len(tb(new[j]))
                 j += 1
-            if got != len(want) or b"".join(tb(t) for t in new[k:j]) != want:
-                continue
+            same = got == len(want) and b"".join(tb(t) for t in new[k:j]) == want
             sp = self._special_ids()
-            if [t for t in seq[k:] if t in sp] != [t for t in new[k:j] if t in sp]:
+            specials = same and [t for t in seq[k:] if t in sp] == [t for t in new[k:j] if t in sp]
+            if not same or not specials:
+                if not told:
+                    ei = seq[k] if k < len(seq) else -1
+                    ri = new[k] if k < len(new) else -1
+                    why = "special tokens differ" if same else "bytes differ"
+                    print(f"[maya] history ids: not spliced, prompt {plen} matched, divergence at {k} ({why}; "
+                          f"engine {ei} {self._history_piece(ei)!r}, render {ri} {self._history_piece(ri)!r})",
+                          flush=True)
+                    told = True
                 continue
+            print(f"[maya] history ids: spliced {len(seq) - k} engine ids over {j - k} re-encoded ids at offset {k} "
+                  f"(prompt {plen})", flush=True)
             return seq + new[j:]
         return new
 
@@ -4769,6 +4819,10 @@ class Service:
                 self.engine.restart()
             cur, left = list(ids) + produced, max_new - len(produced)
             smp = self._resumed_sampling(sampling, produced)   # (the thinking budget counts from where it got to)
+        if produced and not cancel.is_set() and not self.stopping:
+            # GLM length finishes never pass a stop id, so the note inside the loop did not run. Qwen's stop
+            # note already ran; this one is the same sequence and replaces it.
+            self._note_written(ids, produced, emb)
         if len(segments) > 1:                           # the request's figures, over all its slices
             self.engine.last = merge_calls(segments)
         lastd = getattr(self.engine, "last", None)

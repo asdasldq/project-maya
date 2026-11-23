@@ -143,8 +143,35 @@ class ServerClose(unittest.TestCase):
         changed = svc.render_ids(*openai_to_messages({"messages": [u1, other, u2]}))
         self.assertEqual(svc._as_written(changed), changed)
         glm, gtok = self.svc("glm5")
-        glm._note_written(ids, own, None)
-        self.assertFalse(getattr(glm, "_written", None))
+        self.assertTrue(glm.template.glm_effort)
+        gu1 = {"role": "user", "content": "Read the file and tell me."}
+        gu2 = {"role": "user", "content": "And then?"}
+        ga = {"role": "assistant", "content": answer}
+        off = {"enable_thinking": False}
+
+        def g_render(messages):
+            m, t, kw = openai_to_messages({"messages": messages})
+            return glm.render_ids(m, t, {**kw, **off})
+
+        g_ids = g_render([gu1])
+        g_own = [gtok.encode(ch)[0] for ch in answer]   # not the tokenizer's own segmentation
+        self.assertNotEqual(gtok.encode(answer), g_own)
+        glm._note_written(g_ids, g_own, None)            # a length finish: no stop id required
+        self.assertTrue(glm._written)
+        self.assertNotEqual(glm._written[0][0], svc._written[0][0])   # a different model key
+        g_canon = g_render([gu1, ga, gu2])
+        self.assertEqual(g_canon[:len(g_ids)], g_ids)    # thinking off: the closed block is the shared prefix
+        g_next = glm._as_written(g_canon)
+        self.assertEqual(g_next[:len(g_ids) + len(g_own)], g_ids + g_own)
+        self.assertEqual(gtok.decode(g_next), gtok.decode(g_canon))
+        self.assertEqual(glm._as_written(g_render([{"role": "user", "content": "Read it."}, ga, gu2])),
+                         g_render([{"role": "user", "content": "Read it."}, ga, gu2]))
+        changed_a = {"role": "assistant", "content": "The slow brown fox."}
+        changed_ids = g_render([gu1, changed_a, gu2])
+        self.assertEqual(glm._as_written(changed_ids), changed_ids)
+        # another model's remembered ids are not applied here
+        glm._written.append((svc._written[0][0], 0, [9, 9, 9]))
+        self.assertEqual(glm._as_written(g_canon), g_next)
 
     def test_other_templates_and_prompts_keep_the_bare_close(self):
         svc, tok = self.svc("qwen")
